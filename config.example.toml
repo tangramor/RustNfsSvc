@@ -1,0 +1,71 @@
+# RustNfsSvc Configuration File
+# Copy this file to C:\ProgramData\RustNfsSvc\config.toml
+
+[nfs]
+# Address to listen on for NFS connections
+listen_address = "0.0.0.0:2049"
+
+# Enable NFS version 3
+enable_v3 = true
+
+# Enable NFS version 4
+enable_v4 = true
+
+# Number of worker threads
+threads = 4
+
+[exports]
+# Exported directories
+# Format: [[exports.entries]]
+# Required fields:
+#   - path: Local directory path to export
+#   - allowed_clients: List of allowed client networks (CIDR notation)
+# Optional fields:
+#   - options: List of mount options
+#   - description: Human-readable description
+
+[[exports.entries]]
+path = "C:\\Shared"
+allowed_clients = ["192.168.1.0/24", "10.0.0.0/8"]
+options = ["rw", "sync", "no_subtree_check"]
+description = "Shared directory for local network"
+
+# Additional examples (commented out):
+# [[exports.entries]]
+# path = "D:\\Data"
+# allowed_clients = ["192.168.1.100/32"]
+# options = ["ro", "sync"]
+# description = "Read-only export for specific host"
+#
+# [[exports.entries]]
+# path = "C:\\Public"
+# allowed_clients = ["0.0.0.0/0"]
+# options = ["rw", "insecure", "nohide"]
+# description = "Publicly accessible export"
+
+# Export options:
+#   - ro / read-only: Export read-only
+#   - rw / read-write: Export read-write
+#   - sync: Synchronous writes
+#   - async: Asynchronous writes
+#   - no_subtree_check: Disable subtree checking (better performance, less security)
+#   - subtree_check: Enable subtree checking (default for compatibility)
+#   - no_root_squash: Allow root user to access files as root (security risk)
+#   - root_squash: Map root user to anonymous user (default)
+#   - secure: Require secure ports (port < 1024)
+#   - insecure: Allow connections from any port
+#   - nohide: Do not hide subdirectory exports
+#   - hide: Hide subdirectory exports (default)
+
+[logging]
+# Log level: error, warn, info, debug, trace
+level = "info"
+
+# Log file path
+file = "C:\\ProgramData\\RustNfsSvc\\logs\\rustnfssvc.log"
+
+# Maximum log file size in MB before rotation
+max_log_size_mb = 100
+
+# Maximum number of log files to keep
+max_log_files = 10

@@ -1,0 +1,39 @@
+# Build artifacts
+/target/
+/target2/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Log files
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+
+# Test artifacts
+*.tmp
+temp/
+
+# Packet captures
+*.pcap
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local configuration (contains local paths)
+config.toml
+
+# Windows null device artifact
+nul
