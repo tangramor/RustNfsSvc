@@ -112,8 +112,9 @@ fn service_main(_arguments: Vec<OsString>) {
         }
     });
 
+    let config_for_nfs = config.clone();
     let server_handle = runtime.spawn(async move {
-        let nfs_server = crate::nfs::NfsServer::new(exports_clone);
+        let nfs_server = crate::nfs::NfsServer::new(exports_clone, config_for_nfs);
         if let Err(e) = nfs_server.start().await {
             error!("NFS server error: {}", e);
         }

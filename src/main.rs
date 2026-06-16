@@ -47,10 +47,13 @@ async fn main() -> Result<()> {
             info!("RustNfsSvc starting in standalone mode...");
             info!("Configuration loaded successfully");
 
+            // SEC-027: Remind about dependency auditing
+            info!("SEC-027: Ensure 'cargo audit' is run periodically to check for known vulnerabilities in dependencies.");
+
             let exports = std::sync::Arc::new(exports::ExportsManager::new(config.clone()));
             exports.reload_exports_async().await?;
 
-            let nfs_server = nfs::NfsServer::new(exports);
+            let nfs_server = nfs::NfsServer::new(exports, config);
             tokio::spawn(async move {
                 if let Err(e) = nfs_server.start().await {
                     error!("NFS server error: {}", e);

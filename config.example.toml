@@ -14,6 +14,22 @@ enable_v4 = true
 # Number of worker threads
 threads = 4
 
+bind_ip = "0.0.0.0"              # SEC-014
+
+max_connections = 128             # SEC-025
+
+max_conn_rate_per_ip = 10         # SEC-025
+
+enable_udp = true                 # SEC-026 (生产建议 false)
+
+
+[tls]                             # SEC-015
+enabled = false
+
+cert_path = ""
+
+key_path = ""
+
 [exports]
 # Exported directories
 # Format: [[exports.entries]]

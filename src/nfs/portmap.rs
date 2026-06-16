@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 // PORTMAP / RPCBIND protocol (RFC 1833)
 pub struct PortmapServer {
     mappings: Arc<RwLock<HashMap<u64, PortMapping>>>,
+    bind_ip: String,
 }
 
 #[derive(Debug, Clone)]
@@ -51,13 +52,13 @@ const IPPROTO_TCP: u32 = 6;
 const IPPROTO_UDP: u32 = 17;
 
 impl PortmapServer {
-    pub fn new() -> Self {
+    pub fn new(bind_ip: String) -> Self {
         let mappings = Arc::new(RwLock::new(HashMap::new()));
         let m = Arc::clone(&mappings);
         tokio::spawn(async move {
             Self::initialize_mappings(m).await;
         });
-        Self { mappings }
+        Self { mappings, bind_ip }
     }
 
     async fn initialize_mappings(mappings: Arc<RwLock<HashMap<u64, PortMapping>>>) {
@@ -99,25 +100,27 @@ impl PortmapServer {
     }
 
     pub async fn start(&self) -> Result<()> {
-        info!("Starting PORTMAP server on port 111 (TCP+UDP)");
+        info!("Starting PORTMAP server on {} port 111 (TCP+UDP)", self.bind_ip);
 
         let mappings_udp = Arc::clone(&self.mappings);
         let mappings_tcp = Arc::clone(&self.mappings);
+        let bind_ip = self.bind_ip.clone();
 
         // UDP listener
         tokio::spawn(async move {
-            if let Err(e) = Self::run_udp(mappings_udp).await {
+            if let Err(e) = Self::run_udp(mappings_udp, bind_ip).await {
                 error!("PORTMAP UDP error: {}", e);
             }
         });
 
         // TCP listener
-        Self::run_tcp(mappings_tcp).await
+        Self::run_tcp(mappings_tcp, self.bind_ip.clone()).await
     }
 
-    async fn run_udp(mappings: Arc<RwLock<HashMap<u64, PortMapping>>>) -> Result<()> {
-        let socket = UdpSocket::bind("0.0.0.0:111").await?;
-        info!("PORTMAP UDP listening on 0.0.0.0:111");
+    async fn run_udp(mappings: Arc<RwLock<HashMap<u64, PortMapping>>>, bind_ip: String) -> Result<()> {
+        let addr = format!("{}:111", bind_ip);
+        let socket = UdpSocket::bind(&addr).await?;
+        info!("PORTMAP UDP listening on {}", addr);
         let mut buf = [0u8; 4096];
         loop {
             match socket.recv_from(&mut buf).await {
@@ -137,9 +140,10 @@ impl PortmapServer {
         }
     }
 
-    async fn run_tcp(mappings: Arc<RwLock<HashMap<u64, PortMapping>>>) -> Result<()> {
-        let listener = TcpListener::bind("0.0.0.0:111").await?;
-        info!("PORTMAP TCP listening on 0.0.0.0:111");
+    async fn run_tcp(mappings: Arc<RwLock<HashMap<u64, PortMapping>>>, bind_ip: String) -> Result<()> {
+        let addr = format!("{}:111", bind_ip);
+        let listener = TcpListener::bind(&addr).await?;
+        info!("PORTMAP TCP listening on {}", addr);
         loop {
             match listener.accept().await {
                 Ok((mut stream, addr)) => {
@@ -268,17 +272,10 @@ impl PortmapServer {
                 Some(Self::make_accept_reply(xid, SUCCESS, &port.to_be_bytes()))
             }
             PMAPPROC_DUMP => {
-                info!("PORTMAP DUMP");
-                let m = mappings.read().await;
-                let mut body = Vec::new();
-                for mapping in m.values() {
-                    body.extend_from_slice(&[0, 0, 0, 1]); // value_follows = TRUE
-                    body.extend_from_slice(&mapping.program.to_be_bytes());
-                    body.extend_from_slice(&mapping.version.to_be_bytes());
-                    body.extend_from_slice(&mapping.protocol.to_be_bytes());
-                    body.extend_from_slice(&mapping.port.to_be_bytes());
-                }
-                body.extend_from_slice(&[0, 0, 0, 0]); // value_follows = FALSE
+                // SEC-017: Do not leak port mapping information.
+                // Return an empty list instead of all mappings.
+                info!("PORTMAP DUMP: returning empty list (security)");
+                let body = vec![0u8, 0, 0, 0]; // value_follows = FALSE (empty list)
                 Some(Self::make_accept_reply(xid, SUCCESS, &body))
             }
             _ => {

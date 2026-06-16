@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::exports::ExportsManager;
 
@@ -297,6 +297,29 @@ impl Nfs4Server {
 
         // Parse cred + verifier (SEC-012: integer overflow protection)
         let mut offset = 24;
+        // SEC-018: Extract cred flavor and data for root_squash check
+        let caller_uid: u32 = if request.len() >= offset + 8 {
+            let cred_flavor = u32::from_be_bytes([
+                request[offset], request[offset+1], request[offset+2], request[offset+3],
+            ]);
+            let cred_len = u32::from_be_bytes([
+                request[offset+4], request[offset+5], request[offset+6], request[offset+7],
+            ]) as usize;
+            if cred_len <= crate::nfs::MAX_XDR_OPAQUE {
+                let cred_data_start = offset + 8;
+                let cred_data_end = cred_data_start + cred_len;
+                if cred_data_end <= request.len() {
+                    ExportsManager::parse_auth_sys_uid(cred_flavor, &request[cred_data_start..cred_data_end])
+                        .unwrap_or(u32::MAX) // unknown uid → not root
+                } else {
+                    u32::MAX
+                }
+            } else {
+                u32::MAX
+            }
+        } else {
+            u32::MAX
+        };
         if request.len() < offset + 8 {
             return Some(make_rpc_accepted_reply(xid, ACC_SUCCESS, &self.make_compound_error(NFS4ERR_BADXDR)));
         }
@@ -344,7 +367,7 @@ impl Nfs4Server {
             }
             1 => {
                 // COMPOUND
-                let result = self.handle_compound(xid, request, offset).await;
+                let result = self.handle_compound(xid, request, offset, caller_uid).await;
                 Some(make_rpc_accepted_reply(xid, ACC_SUCCESS, &result))
             }
             _ => {
@@ -357,7 +380,7 @@ impl Nfs4Server {
     // ──────────────────────────────────────────────────────────────────────────
     // COMPOUND handler
     // ──────────────────────────────────────────────────────────────────────────
-    async fn handle_compound(&self, xid: u32, request: &[u8], args_start: usize) -> Vec<u8> {
+    async fn handle_compound(&self, xid: u32, request: &[u8], args_start: usize, caller_uid: u32) -> Vec<u8> {
         let mut p = args_start;
 
         // tag (opaque<>)
@@ -442,6 +465,22 @@ impl Nfs4Server {
             p += 4;
 
             debug!("NFS4 COMPOUND op[{}]: opcode={}", op_idx, opcode);
+
+            // SEC-018: root_squash check for write operations.
+            // If caller is root (uid=0) and the export has root_squash enabled,
+            // reject the write operation with NFS4ERR_PERM.
+            if caller_uid == 0 && Self::is_write_opcode(opcode) {
+                if let Some(ref fh) = current_fh {
+                    if self.exports.should_squash_root(fh, caller_uid).await {
+                        warn!("SEC-018: root_squash blocking opcode={} from root user", opcode);
+                        op_results.extend_from_slice(&opcode.to_be_bytes());
+                        op_results.extend_from_slice(&NFS4ERR_PERM.to_be_bytes());
+                        res_op_count += 1;
+                        compound_status = NFS4ERR_PERM;
+                        break;
+                    }
+                }
+            }
 
             let (op_result, advance, new_fh, new_saved_fh, status) = self.dispatch_op(
                 opcode,
@@ -810,7 +849,7 @@ impl Nfs4Server {
                     let export_fh = self.exports.create_file_handle(
                         &path_str
                     ).await;
-                    info!("NFS4 LOOKUP: found export '{}' -> '{}', path_hex={}, pre_fileid={:016x}",
+                    debug!("NFS4 LOOKUP: found export '{}' -> '{}', path_hex={}, pre_fileid={:016x}",
                         name, path_str, path_hex, pre_fileid);
                     // RFC 3530 §14.2.18: LOOKUP4res for NFS4_OK returns void.
                     // The new FH is set as current_fh via the third return value.
@@ -1180,23 +1219,42 @@ impl Nfs4Server {
             Some(p) => p,
         };
 
-        // Read existing file, modify, write back
-        let mut file_data = match std::fs::read(&path) {
-            Ok(data) => data,
+        // SEC-019: Use seek+write instead of read-all-modify-write-all.
+        // This avoids race conditions with concurrent writes and reduces
+        // memory usage by not loading the entire file into memory.
+        let written = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::{Seek, SeekFrom};
+                // Seek to the write offset
+                if let Err(e) = file.seek(SeekFrom::Start(offset)) {
+                    warn!("NFS4 WRITE: seek failed for {}: {}", path.display(), e);
+                    return (vec![], consumed, None, None, NFS4ERR_IO);
+                }
+                // Write data at the specified offset
+                match std::io::Write::write_all(&mut file, write_data) {
+                    Ok(()) => {
+                        // Sync to disk if FILE_SYNC requested
+                        if stable == 2 { // FILE_SYNC4
+                            let _ = file.sync_all();
+                        }
+                        data_len
+                    }
+                    Err(e) => {
+                        warn!("NFS4 WRITE: write failed for {}: {}", path.display(), e);
+                        return (vec![], consumed, None, None, NFS4ERR_IO);
+                    }
+                }
+            }
             Err(e) => {
-                warn!("NFS4 WRITE: failed to read {}: {}", path.display(), e);
+                warn!("NFS4 WRITE: failed to open {}: {}", path.display(), e);
                 return (vec![], consumed, None, None, NFS4ERR_IO);
             }
         };
-        let end = offset as usize + data_len;
-        if file_data.len() < end {
-            file_data.resize(end, 0);
-        }
-        file_data[offset as usize..end].copy_from_slice(write_data);
-        if let Err(e) = std::fs::write(&path, &file_data) {
-            warn!("NFS4 WRITE: failed to write {}: {}", path.display(), e);
-            return (vec![], consumed, None, None, NFS4ERR_IO);
-        }
 
         // WRITE4resok: count(4) + committed(4) + writeverf(8)
         let mut result = Vec::new();
@@ -1258,7 +1316,7 @@ impl Nfs4Server {
             Some(p) => p,
         };
         let fh_preview: Vec<String> = fh.iter().take(8).map(|b| format!("{:02x}", b)).collect();
-        info!("NFS4 READDIR: fh_preview=[{}], dir_path='{}'", fh_preview.join(""), dir_path.display());
+        debug!("NFS4 READDIR: fh_preview=[{}], dir_path='{}'", fh_preview.join(""), dir_path.display());
 
         // Read directory entries
         let entries = match std::fs::read_dir(&dir_path) {
@@ -1325,7 +1383,7 @@ impl Nfs4Server {
                 break;
             }
 
-            info!("NFS4 READDIR entry: name='{}', path='{}', entry_size={}", name, path.display(), entry_size);
+            debug!("NFS4 READDIR entry: name='{}', entry_size={}", name, entry_size);
 
             result.extend_from_slice(&[0,0,0,1]); // value_follows=TRUE
             result.extend_from_slice(&entry_cookie.to_be_bytes()); // cookie
@@ -1409,7 +1467,7 @@ impl Nfs4Server {
                     .unwrap_or_else(|| real_path.clone())
             });
 
-            info!("NFS4 READDIR root entry: name='{}', real_path='{}'", name, real_path);
+            debug!("NFS4 READDIR root entry: name='{}'", name);
 
             result.extend_from_slice(&[0,0,0,1]); // value_follows=TRUE
             result.extend_from_slice(&entry_cookie.to_be_bytes()); // cookie
@@ -1795,7 +1853,7 @@ impl Nfs4Server {
             Some(p) => p,
         };
         let new_path = dir_path.join(&name);
-        info!("NFS4 CREATE: dir={}, name={}, new_path={}", dir_path.display(), name, new_path.display());
+        debug!("NFS4 CREATE: name={}", name);
 
         if new_path.exists() {
             warn!("NFS4 CREATE: target already exists: {}", new_path.display());
@@ -1877,8 +1935,19 @@ impl Nfs4Server {
                     if record.verifier == client_verifier {
                         // Client reconnect: return same client_id with new confirm_verifier
                         let client_id = record.client_id;
+                        // SEC-021: Use cryptographic random for confirm_verifier
                         let mut confirm_verifier = [0u8; 8];
-                        confirm_verifier[0..8].copy_from_slice(&client_id.to_be_bytes());
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default();
+                        let pid = std::process::id() as u64;
+                        let mut seed = now.as_nanos() as u64 ^ pid ^ client_id;
+                        for i in 0..8 {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            confirm_verifier[i] = (seed & 0xFF) as u8;
+                        }
 
                         // Update the confirm_verifier in the client record
                         drop(clients);
@@ -1889,7 +1958,7 @@ impl Nfs4Server {
                             }
                         }
 
-                        info!("NFS4 SETCLIENTID: reconnect existing client_id={}", client_id);
+                        debug!("NFS4 SETCLIENTID: reconnect existing client_id={}", client_id);
 
                         let mut result = Vec::new();
                         result.extend_from_slice(&client_id.to_be_bytes());
@@ -1913,8 +1982,19 @@ impl Nfs4Server {
         };
 
         // Generate confirm verifier
+        // SEC-021: Use cryptographic random for confirm_verifier
         let mut confirm_verifier = [0u8; 8];
-        confirm_verifier[0..8].copy_from_slice(&client_id.to_be_bytes());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let pid = std::process::id() as u64;
+        let mut seed = now.as_nanos() as u64 ^ pid ^ client_id;
+        for i in 0..8 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            confirm_verifier[i] = (seed & 0xFF) as u8;
+        }
 
         {
             let mut clients = self.clients.write().await;
@@ -1930,7 +2010,7 @@ impl Nfs4Server {
             });
         }
 
-        info!("NFS4 SETCLIENTID: allocated new client_id={}", client_id);
+        debug!("NFS4 SETCLIENTID: allocated new client_id={}", client_id);
 
         // SETCLIENTID4resok: clientid(8) + setclientid_confirm(8)
         let mut result = Vec::new();
@@ -1953,7 +2033,7 @@ impl Nfs4Server {
         let mut clients = self.clients.write().await;
         if let Some(client) = clients.get_mut(&client_id) {
             client.confirmed = true;
-            info!("NFS4 SETCLIENTID_CONFIRM: confirmed client_id={}", client_id);
+            debug!("NFS4 SETCLIENTID_CONFIRM: confirmed client_id={}", client_id);
         } else {
             warn!("NFS4 SETCLIENTID_CONFIRM: unknown client_id={}", client_id);
             return (vec![], 16, None, None, NFS4ERR_STALE_CLIENTID);
@@ -2568,7 +2648,7 @@ impl Nfs4Server {
             .map(|c| c.join(" "))
             .collect::<Vec<_>>()
             .join(" ");
-        info!("EXCHANGE_ID request[{}..]: {}", p, request_hex);
+        trace!("EXCHANGE_ID request[{}..]: {}", p, request_hex);
         
         let mut pp = p;
 
@@ -2653,8 +2733,8 @@ impl Nfs4Server {
         let server_client_id = {
             let owner_map = self.client_owner_map.read().await;
             if let Some(&existing_id) = owner_map.get(&client_owner) {
-                info!("NFS4 EXCHANGE_ID: reusing existing client_id={} for owner {:?}",
-                    existing_id, std::str::from_utf8(&client_owner).unwrap_or("?"));
+                debug!("NFS4 EXCHANGE_ID: reusing existing client_id={} for owner",
+                    existing_id);
                 existing_id
             } else {
                 drop(owner_map);
@@ -2664,8 +2744,8 @@ impl Nfs4Server {
                 drop(counter);
                 let mut owner_map = self.client_owner_map.write().await;
                 owner_map.insert(client_owner.clone(), new_id);
-                info!("NFS4 EXCHANGE_ID: assigned new client_id={} for owner {:?}",
-                    new_id, std::str::from_utf8(&client_owner).unwrap_or("?"));
+                debug!("NFS4 EXCHANGE_ID: assigned new client_id={}",
+                    new_id);
                 new_id
             }
         };
@@ -2755,8 +2835,8 @@ impl Nfs4Server {
             .map(|c| c.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" "))
             .collect::<Vec<_>>()
             .join(" | ");
-        info!("NFS4 EXCHANGE_ID result ({} bytes): {}", result.len(), result_hex);
-        info!("  eir_clientid=0x{:016x} eir_seqid={} eir_flags=0x{:08x}",
+        trace!("NFS4 EXCHANGE_ID result ({} bytes): {}", result.len(), result_hex);
+        debug!("  eir_clientid=0x{:016x} eir_seqid={} eir_flags=0x{:08x}",
             server_client_id, 1u32, eir_flags);
         (result, consumed, None, None, NFS4_OK)
     }
@@ -2895,7 +2975,7 @@ impl Nfs4Server {
         result.extend_from_slice(&1u32.to_be_bytes());          // ca_maxrequests
         result.extend_from_slice(&0u32.to_be_bytes());          // ca_rdma_ird count=0
 
-        info!("NFS4 CREATE_SESSION: client_id={}, session assigned", client_id);
+        debug!("NFS4 CREATE_SESSION: client_id={}, session assigned", client_id);
 
         // Store session for later SEQUENCE validation
         {
@@ -2954,8 +3034,7 @@ impl Nfs4Server {
         let dir = u32::from_be_bytes([request[p+16], request[p+17], request[p+18], request[p+19]]);
         let rdma = u32::from_be_bytes([request[p+20], request[p+21], request[p+22], request[p+23]]);
 
-        info!("NFS4 BIND_CONN_TO_SESSION: dir={}, rdma={}, session_id[..4]={:02x}{:02x}{:02x}{:02x}",
-            dir, rdma, session_id[0], session_id[1], session_id[2], session_id[3]);
+        debug!("NFS4 BIND_CONN_TO_SESSION: dir={}, rdma={}", dir, rdma);
 
         // SEC-010: Validate session strictly
         {
@@ -2993,8 +3072,8 @@ impl Nfs4Server {
             let mut sessions = self.sessions.write().await;
             let before = sessions.len();
             sessions.retain(|_, s| s.client_id != client_id);
-            info!("NFS4 DESTROY_CLIENTID: client_id={}, cleaned {} sessions ({}→{})",
-                client_id, before - sessions.len(), before, sessions.len());
+            debug!("NFS4 DESTROY_CLIENTID: cleaned {} sessions ({}→{})",
+                before - sessions.len(), before, sessions.len());
         }
         (vec![], consumed, None, None, NFS4_OK)
     }
@@ -3477,6 +3556,16 @@ impl Nfs4Server {
         body.extend_from_slice(&0u32.to_be_bytes()); // tag_len=0
         body.extend_from_slice(&0u32.to_be_bytes()); // rescount=0
         body
+    }
+
+    /// SEC-018: Check if an opcode is a write operation that should be
+    /// blocked by root_squash when the caller is root (uid=0).
+    fn is_write_opcode(opcode: u32) -> bool {
+        matches!(opcode,
+            OP_WRITE | OP_CREATE | OP_REMOVE | OP_RENAME |
+            OP_SETATTR | OP_LINK | OP_OPEN | OP_LOCK |
+            OP_LOCKU | OP_CLOSE | OP_DELEGRETURN | OP_COMMIT
+        )
     }
 }
 

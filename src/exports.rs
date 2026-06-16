@@ -35,7 +35,7 @@ impl Default for ExportOptions {
             read_only: false,
             sync: true,
             no_subtree_check: true,
-            root_squash: false, // easier for initial testing
+            root_squash: true, // SEC-018: default to true for security
             secure: false,      // accept connections from any port
             nohide: false,
         }
@@ -283,6 +283,49 @@ impl ExportsManager {
         false
     }
 
+    /// SEC-018: Check if root_squash should be applied for the given file handle.
+    /// Returns true if the export has root_squash enabled and the caller's uid is 0 (root).
+    pub async fn should_squash_root(&self, fh: &[u8], uid: u32) -> bool {
+        if uid != 0 { return false; } // only squash root
+        let export_root = match self.get_fh_export_root(fh).await {
+            Some(root) => root,
+            None => return false,
+        };
+        let export_root_str = export_root.to_string_lossy().to_string();
+        if let Some(export) = self.resolve_export_path(&export_root_str).await {
+            return export.options.root_squash;
+        }
+        false
+    }
+
+    /// SEC-018: Parse AUTH_SYS credentials from an RPC request to extract uid.
+    /// AUTH_SYS format: stamp(4) + machinename_len(4) + machinename + uid(4) + gid(4) + gids_count(4) + gids...
+    /// Returns the uid, or None if parsing fails or credentials are not AUTH_SYS.
+    pub fn parse_auth_sys_uid(cred_flavor: u32, cred_data: &[u8]) -> Option<u32> {
+        // AUTH_SYS flavor = 1
+        if cred_flavor != 1 { return None; }
+        // Minimum AUTH_SYS data: stamp(4) + machinename_len(4) + uid(4) = 12 bytes minimum
+        // But machinename_len includes the name itself
+        if cred_data.len() < 12 { return None; }
+        // Skip stamp (4 bytes)
+        let name_len = u32::from_be_bytes([
+            cred_data[4], cred_data[5], cred_data[6], cred_data[7],
+        ]) as usize;
+        let name_padded = (name_len + 3) & !3;
+        let uid_offset = 8 + name_padded;
+        if uid_offset + 4 > cred_data.len() { return None; }
+        let uid = u32::from_be_bytes([
+            cred_data[uid_offset], cred_data[uid_offset + 1],
+            cred_data[uid_offset + 2], cred_data[uid_offset + 3],
+        ]);
+        Some(uid)
+    }
+
+    /// SEC-018: The anonymous uid/gid used when root_squash is applied.
+    /// Following Linux NFS convention, root is mapped to nobody (65534).
+    pub const ANONYMOUS_UID: u32 = 65534;
+    pub const ANONYMOUS_GID: u32 = 65534;
+
     pub async fn list_exports(&self) -> Vec<String> {
         let exports = self.exports.read().await;
         exports.keys().cloned().collect()
@@ -481,11 +524,38 @@ impl ExportsManager {
     }
 
     /// Resolve file handle to real filesystem path (with HMAC verification, SEC-006)
+    /// SEC-020: Also verifies the canonical path stays within the export root
+    /// to prevent symlink attacks that escape the export boundary.
     pub async fn resolve_fh(&self, handle: &[u8]) -> Option<PathBuf> {
         let fhid = self.verify_and_decode_fhid(handle)?;
         if fhid == 0 { return None; }
-        let map = self.fh_map.read().await;
-        map.get(&fhid).map(|e| e.real_path.clone())
+        let (real_path, export_root) = {
+            let map = self.fh_map.read().await;
+            match map.get(&fhid) {
+                Some(e) => (e.real_path.clone(), e.export_root.clone()),
+                None => return None,
+            }
+        };
+
+        // SEC-020: If the path is a symlink, verify it stays within export root.
+        // Only check when the path exists (avoid overhead for non-existent paths).
+        if real_path.exists() && real_path.is_symlink() {
+            let canonical = match std::fs::canonicalize(&real_path) {
+                Ok(c) => c,
+                Err(_) => return Some(real_path), // can't verify, return as-is
+            };
+            let canonical_root = match std::fs::canonicalize(&export_root) {
+                Ok(c) => c,
+                Err(_) => return Some(real_path), // can't verify, return as-is
+            };
+            if !canonical.starts_with(&canonical_root) {
+                warn!("SEC-020: symlink escape blocked: {} -> {} (outside {})",
+                      real_path.display(), canonical.display(), canonical_root.display());
+                return None;
+            }
+        }
+
+        Some(real_path)
     }
 
     /// Get the export root for a file handle (with HMAC verification, SEC-006)

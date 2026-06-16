@@ -25,31 +25,35 @@ const MOUNTPROC_EXPORT: u32 = 5;
 /// MOUNT protocol server (RFC 1813)
 pub struct MountServer {
     exports: Arc<ExportsManager>,
+    bind_ip: String,
 }
 
 impl MountServer {
-    pub fn new(exports: Arc<ExportsManager>) -> Self {
-        Self { exports }
+    pub fn new(exports: Arc<ExportsManager>, bind_ip: String) -> Self {
+        Self { exports, bind_ip }
     }
 
     pub async fn start(&self) -> Result<()> {
-        info!("Starting MOUNT server on port 20048 (TCP+UDP)");
+        info!("Starting MOUNT server on {} port 20048 (TCP+UDP)", self.bind_ip);
 
         let exports_udp = Arc::clone(&self.exports);
         let exports_tcp = Arc::clone(&self.exports);
+        let bind_ip_udp = self.bind_ip.clone();
+        let bind_ip_tcp = self.bind_ip.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = Self::run_udp(exports_udp).await {
+            if let Err(e) = Self::run_udp(exports_udp, bind_ip_udp).await {
                 error!("MOUNT UDP error: {}", e);
             }
         });
 
-        Self::run_tcp(exports_tcp).await
+        Self::run_tcp(exports_tcp, bind_ip_tcp).await
     }
 
-    async fn run_udp(exports: Arc<ExportsManager>) -> Result<()> {
-        let socket = UdpSocket::bind("0.0.0.0:20048").await?;
-        info!("MOUNT UDP listening on 0.0.0.0:20048");
+    async fn run_udp(exports: Arc<ExportsManager>, bind_ip: String) -> Result<()> {
+        let addr = format!("{}:20048", bind_ip);
+        let socket = UdpSocket::bind(&addr).await?;
+        info!("MOUNT UDP listening on {}", addr);
         let mut buf = [0u8; 8192];
         loop {
             match socket.recv_from(&mut buf).await {
@@ -68,9 +72,10 @@ impl MountServer {
         }
     }
 
-    async fn run_tcp(exports: Arc<ExportsManager>) -> Result<()> {
-        let listener = TcpListener::bind("0.0.0.0:20048").await?;
-        info!("MOUNT TCP listening on 0.0.0.0:20048");
+    async fn run_tcp(exports: Arc<ExportsManager>, bind_ip: String) -> Result<()> {
+        let addr = format!("{}:20048", bind_ip);
+        let listener = TcpListener::bind(&addr).await?;
+        info!("MOUNT TCP listening on {}", addr);
         loop {
             match listener.accept().await {
                 Ok((mut stream, addr)) => {
@@ -212,11 +217,16 @@ impl MountServer {
                 Some(make_accept_reply(xid, SUCCESS, &[]))
             }
             MOUNTPROC_EXPORT => {
-                info!("MOUNT EXPORT");
-                // Build export list
+                info!("MOUNT EXPORT from {}", client_ip);
+                // SEC-016: Check client IP before returning export list.
+                // Only return exports that this client is allowed to access.
                 let export_list = exports.list_exports_with_aliases().await;
                 let mut body = Vec::new();
                 for (path, alias) in &export_list {
+                    // Check if client is allowed for this export
+                    if !exports.is_client_allowed(client_ip, path).await {
+                        continue; // skip exports not allowed for this client
+                    }
                     body.extend_from_slice(&[0, 0, 0, 1]); // value_follows=TRUE
                     // export dir name (use alias if available, otherwise path)
                     let name = alias.as_deref().unwrap_or(path.as_str());

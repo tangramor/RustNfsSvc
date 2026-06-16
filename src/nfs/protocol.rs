@@ -58,6 +58,23 @@ impl NfsProtocolServer {
 
         // Parse credentials + verifier to get args offset (SEC-012: overflow protection)
         let mut args_off = 24;
+        // SEC-018: Extract caller uid for root_squash check
+        let caller_uid: u32 = if request.len() > args_off + 8 {
+            let cred_flavor = u32::from_be_bytes([
+                request[args_off], request[args_off+1], request[args_off+2], request[args_off+3],
+            ]);
+            let cred_len = u32::from_be_bytes([
+                request[args_off+4], request[args_off+5], request[args_off+6], request[args_off+7],
+            ]) as usize;
+            if cred_len <= crate::nfs::MAX_XDR_OPAQUE && args_off + 8 + cred_len <= request.len() {
+                ExportsManager::parse_auth_sys_uid(cred_flavor, &request[args_off+8..args_off+8+cred_len])
+                    .unwrap_or(u32::MAX)
+            } else {
+                u32::MAX
+            }
+        } else {
+            u32::MAX
+        };
         if request.len() > args_off + 8 {
             let cred_len = u32::from_be_bytes([
                 request[args_off+4], request[args_off+5], request[args_off+6], request[args_off+7],
@@ -399,17 +416,40 @@ impl NfsProtocolServer {
 
         let path = self.exports.resolve_fh(fh_data).await;
         let written = if let Some(ref p) = path {
-            let mut file_data = match std::fs::read(p) {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!("NFS3 WRITE: failed to read {}: {}", p.display(), e);
-                    return None;
+            // SEC-019: Use seek+write instead of read-all-modify-write-all.
+            // Avoids race conditions with concurrent writes and reduces memory usage.
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(p)
+            {
+                Ok(mut file) => {
+                    use std::io::{Seek, SeekFrom};
+                    match file.seek(SeekFrom::Start(file_offset)) {
+                        Ok(_) => {
+                            match std::io::Write::write_all(&mut file, write_data) {
+                                Ok(()) => {
+                                    let _ = file.sync_all();
+                                    data_len
+                                }
+                                Err(e) => {
+                                    warn!("NFS3 WRITE: write failed for {}: {}", p.display(), e);
+                                    0
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("NFS3 WRITE: seek failed for {}: {}", p.display(), e);
+                            0
+                        }
+                    }
                 }
-            };
-            let end = file_offset as usize + data_len;
-            if file_data.len() < end { file_data.resize(end, 0); }
-            file_data[file_offset as usize..end].copy_from_slice(write_data);
-            if std::fs::write(p, &file_data).is_ok() { data_len } else { 0 }
+                Err(e) => {
+                    warn!("NFS3 WRITE: failed to open {}: {}", p.display(), e);
+                    0
+                }
+            }
         } else { 0 };
 
         let mut r = self.make_rpc_reply(xid);
