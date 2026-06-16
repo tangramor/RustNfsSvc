@@ -21,12 +21,10 @@ A high-performance NFS (Network File System) server for Windows, written in Rust
 ```
 RustNfsSvc/
 ├── src/
-│   ├── main.rs              # Entry point (CLI + service mode)
-│   ├── service.rs           # Windows Service wrapper
+│   ├── main.rs              # Entry point: CLI arg parsing (install/uninstall/service/standalone)
+│   ├── service.rs           # Windows Service lifecycle (install/uninstall via sc.exe, run mode)
 │   ├── config.rs            # Configuration loading and validation
 │   ├── exports.rs           # Export directory management and file handle resolution
-│   ├── install.rs           # Windows Service installer binary
-│   ├── uninstall.rs         # Windows Service uninstaller binary
 │   ├── logging.rs           # Log initialization and rotation
 │   └── nfs/
 │       ├── mod.rs           # Unified NFS server (TCP + UDP, v3 + v4)

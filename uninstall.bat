@@ -26,10 +26,9 @@ if %errorLevel% equ 0 (
     echo [INFO] Service was not running
 )
 
-REM Uninstall service
+REM Uninstall service using rustnfssvc.exe uninstall subcommand
 echo Uninstalling Windows Service...
-cd target\release
-uninstall_service.exe
+target\release\rustnfssvc.exe uninstall
 
 if %errorLevel% equ 0 (
     echo [OK] Service uninstalled

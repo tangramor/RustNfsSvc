@@ -21,12 +21,10 @@
 ```
 RustNfsSvc/
 ├── src/
-│   ├── main.rs              # 入口（CLI + 服务模式）
-│   ├── service.rs           # Windows 服务封装
+│   ├── main.rs              # 入口：CLI 参数解析（install/uninstall/service/独立运行）
+│   ├── service.rs           # Windows 服务生命周期（通过 sc.exe 安装/卸载，运行模式）
 │   ├── config.rs            # 配置加载与验证
 │   ├── exports.rs           # 导出目录管理与文件句柄解析
-│   ├── install.rs           # Windows 服务安装器
-│   ├── uninstall.rs         # Windows 服务卸载器
 │   ├── logging.rs           # 日志初始化与轮转
 │   └── nfs/
 │       ├── mod.rs           # 统一 NFS 服务器（TCP + UDP，v3 + v4）

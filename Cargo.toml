@@ -44,6 +44,12 @@ path-clean = "1.0"
 # Network utilities
 ipnet = { version = "2.9", features = ["serde"] }
 
+# Ctrl-C / signal handling (used by service mode)
+ctrlc = "3.4"
+
+# Windows Service support
+windows-service = "0.6"
+
 [dev-dependencies]
 tempfile = "3.8"
 

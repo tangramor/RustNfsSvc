@@ -68,6 +68,29 @@ pub fn init(config: &LoggingConfig) -> Result<()> {
     Ok(())
 }
 
+/// Initialize minimal stderr-only logging (for install/uninstall subcommands).
+///
+/// These subcommands run before any config is loaded, so we just use a simple
+/// stderr subscriber with INFO level (overridable by `RUST_LOG`).
+pub fn init_stderr() -> Result<()> {
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let console_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_file(false)
+        .with_line_number(false);
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(console_layer)
+        .init();
+
+    Ok(())
+}
+
 /// Resolve the log directory from config, with fallback.
 ///
 /// Priority:

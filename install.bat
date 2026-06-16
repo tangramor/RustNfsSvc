@@ -71,10 +71,9 @@ echo.
 echo [OK] Build successful
 echo.
 
-REM Install service
+REM Install service using rustnfssvc.exe install subcommand
 echo Installing Windows Service...
-cd target\release
-install_service.exe
+target\release\rustnfssvc.exe install
 
 if %errorLevel% equ 0 (
     echo.
@@ -89,7 +88,7 @@ if %errorLevel% equ 0 (
     echo   net stop rustnfssvc
     echo.
     echo To uninstall the service, run:
-    echo   uninstall_service.exe
+    echo   uninstall.bat
     echo.
     echo Configuration file: %PROGRAM_DATA%\config.toml
     echo Log file: %PROGRAM_DATA%\logs\rustnfssvc.log
@@ -99,8 +98,7 @@ if %errorLevel% equ 0 (
     echo ERROR: Service installation failed!
     echo.
     echo You can install the service manually:
-    echo   cd target\release
-    echo   install_service.exe
+    echo   target\release\rustnfssvc.exe install
     echo.
 )
 

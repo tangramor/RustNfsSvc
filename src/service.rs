@@ -1,178 +1,258 @@
 use anyhow::{Context, Result};
-use std::sync::Arc;
-use tokio::sync::mpsc;
-use tracing::{error, info};
-use windows_service::service::{ServiceControl, ServiceControlAccept};
-use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+use std::ffi::OsString;
+use std::sync::mpsc;
+use std::time::Duration;
+use tokio::runtime::Runtime;
+use tracing::{error, info, warn};
+use windows_service::define_windows_service;
+use windows_service::service_control_handler::{register, ServiceControlHandlerResult};
+use windows_service::service_dispatcher;
+use windows_service::{
+    service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    },
+    Error as WsError,
+};
 
+use crate::config::load_config;
 use crate::exports::ExportsManager;
 
-const SERVICE_NAME: &str = "RustNfsSvc";
-const SERVICE_START_MODE: windows_service::service::ServiceStartType =
-    windows_service::service::ServiceStartType::AutoStart;
-const SERVICE_ERROR_CONTROL: windows_service::service::ServiceErrorControl =
-    windows_service::service::ServiceErrorControl::Normal;
+const SERVICE_NAME: &str = "rustnfssvc";
+const SERVICE_DISPLAY_NAME: &str = "Rust NFS Server Service";
 
-pub async fn run_service(exports: Arc<ExportsManager>) -> Result<()> {
-    info!("Initializing Windows Service");
+/// Define the Windows Service entry point macro.
+define_windows_service!(ffi_service_main, service_main);
 
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+/// The real service entry point, called by the dispatcher after SCM starts us.
+fn service_main(_arguments: Vec<OsString>) {
+    info!("SCM: service_main entered");
 
-    // Register service control handler with SCM
-    let shutdown_tx_for_handler = shutdown_tx.clone();
-    let service_name_str = SERVICE_NAME.to_string();
-    let status_handle = service_control_handler::register(&service_name_str, move |control_event| {
+    // Create a channel to receive stop signal from the control handler
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+
+    // Register service control handler
+    let status_handle = match register(SERVICE_NAME, move |control_event| {
         match control_event {
             ServiceControl::Stop | ServiceControl::Shutdown => {
-                info!("SCM: received stop/shutdown event");
-                let _ = shutdown_tx_for_handler.try_send(());
+                let _ = stop_tx.send(());
                 ServiceControlHandlerResult::NoError
             }
-            _ => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
         }
-    }).context("Failed to register service control handler")?;
-
-    // Set service status to running
-    let service_status = windows_service::service::ServiceStatus {
-        service_type: windows_service::service::ServiceType::OWN_PROCESS,
-        current_state: windows_service::service::ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
-        exit_code: windows_service::service::ServiceExitCode::Win32(0),
-        checkpoint: 0,
-        wait_hint: std::time::Duration::default(),
-        process_id: None,
+    }) {
+        Ok(handle) => handle,
+        Err(e) => {
+            error!("Failed to register service control handler: {}", e);
+            return;
+        }
     };
-    status_handle.set_service_status(service_status)
-        .context("Failed to set service status to running")?;
 
-    // Start NFS server
-    let exports_clone = Arc::clone(&exports);
-    let mut server_handle = tokio::spawn(async move {
+    // Report SERVICE_START_PENDING
+    report_status(
+        &status_handle,
+        ServiceState::StartPending,
+        ServiceExitCode::Win32(0),
+        3000,
+    );
+
+    // Load config and initialize logging
+    let config = match load_config() {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            error!("Failed to load config: {}", e);
+            report_status(
+                &status_handle,
+                ServiceState::Stopped,
+                ServiceExitCode::Win32(1),
+                0,
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = crate::logging::init(&config.logging) {
+        eprintln!("WARNING: logging init failed: {}", e);
+    }
+
+    info!("RustNfsSvc Windows Service starting...");
+
+    // Report SERVICE_RUNNING
+    report_status(
+        &status_handle,
+        ServiceState::Running,
+        ServiceExitCode::Win32(0),
+        0,
+    );
+
+    info!("Service state: RUNNING");
+
+    // Create a dedicated tokio Runtime for the NFS server
+    let runtime = match Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            error!("Failed to create tokio runtime: {}", e);
+            report_status(
+                &status_handle,
+                ServiceState::Stopped,
+                ServiceExitCode::Win32(1),
+                0,
+            );
+            return;
+        }
+    };
+
+    // Pre-load exports
+    let exports = std::sync::Arc::new(ExportsManager::new(config.clone()));
+    let exports_clone = std::sync::Arc::clone(&exports);
+
+    runtime.block_on(async {
+        if let Err(e) = exports_clone.reload_exports_async().await {
+            error!("Failed to load exports: {}", e);
+        }
+    });
+
+    let server_handle = runtime.spawn(async move {
         let nfs_server = crate::nfs::NfsServer::new(exports_clone);
         if let Err(e) = nfs_server.start().await {
             error!("NFS server error: {}", e);
         }
     });
 
-    info!("NFS server started");
+    info!("NFS server started inside service runtime");
 
-    // Wait for shutdown
-    tokio::select! {
-        _ = shutdown_rx.recv() => {
-            info!("Shutting down service...");
-            server_handle.abort();
-        }
-        result = &mut server_handle => {
-            if let Err(e) = result {
-                error!("Server task error: {}", e);
-            }
-        }
-    }
+    // Wait for stop signal (blocks this thread)
+    let _ = stop_rx.recv();
 
-    // Set service status to stopped
-    let stopped_status = windows_service::service::ServiceStatus {
-        service_type: windows_service::service::ServiceType::OWN_PROCESS,
-        current_state: windows_service::service::ServiceState::Stopped,
-        controls_accepted: ServiceControlAccept::empty(),
-        exit_code: windows_service::service::ServiceExitCode::Win32(0),
-        checkpoint: 0,
-        wait_hint: std::time::Duration::default(),
-        process_id: None,
-    };
-    let _ = status_handle.set_service_status(stopped_status);
+    info!("SCM: received stop/shutdown signal, shutting down...");
+
+    // Report SERVICE_STOP_PENDING
+    report_status(
+        &status_handle,
+        ServiceState::StopPending,
+        ServiceExitCode::Win32(0),
+        3000,
+    );
+
+    // Abort the server task
+    server_handle.abort();
+
+    let _ = runtime.shutdown_timeout(Duration::from_secs(5));
 
     info!("Service stopped");
-    Ok(())
+
+    // Report SERVICE_STOPPED
+    report_status(
+        &status_handle,
+        ServiceState::Stopped,
+        ServiceExitCode::Win32(0),
+        0,
+    );
 }
 
-pub fn install_service() -> Result<()> {
-    info!("Installing service {}", SERVICE_NAME);
-
-    let manager_access = windows_service::service_manager::ServiceManagerAccess::CONNECT
-        | windows_service::service_manager::ServiceManagerAccess::CREATE_SERVICE;
-
-    let service_manager = windows_service::service_manager::ServiceManager::local_computer(None::<&str>, manager_access)?;
-
-    // Get current executable path
-    let exe_path = std::env::current_exe()
-        .context("Failed to get current executable path")?;
-
-    let service_info = windows_service::service::ServiceInfo {
-        name: std::ffi::OsString::from(SERVICE_NAME),
-        display_name: std::ffi::OsString::from("Rust NFS Server Service"),
-        service_type: windows_service::service::ServiceType::OWN_PROCESS,
-        start_type: windows_service::service::ServiceStartType::AutoStart,
-        error_control: windows_service::service::ServiceErrorControl::Normal,
-        executable_path: exe_path,
-        launch_arguments: vec![],
-        dependencies: vec![],
-        account_name: None,
-        account_password: None,
+/// Helper: report service status to SCM.
+fn report_status(
+    status_handle: &windows_service::service_control_handler::ServiceStatusHandle,
+    state: ServiceState,
+    exit_code: ServiceExitCode,
+    wait_hint: u32,
+) {
+    let status = ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: state,
+        controls_accepted: if state == ServiceState::Running || state == ServiceState::StartPending {
+            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
+        } else {
+            ServiceControlAccept::empty()
+        },
+        exit_code,
+        checkpoint: 0,
+        wait_hint: Duration::from_millis(wait_hint as u64),
+        process_id: None,
     };
 
-    let _service = service_manager
-        .create_service(&service_info, windows_service::service::ServiceAccess::empty())
-        .context("Failed to create service")?;
+    if let Err(e) = status_handle.set_service_status(status) {
+        error!("Failed to set service status ({:?}): {}", state, e);
+    }
+}
+
+/// Run as a Windows Service.
+pub fn run_service() -> Result<()> {
+    info!("Entering Windows Service mode (calling service_dispatcher::start)");
+    service_dispatcher::start(SERVICE_NAME, ffi_service_main)
+        .context("Failed to start Windows Service dispatcher")?;
+    info!("Windows Service dispatcher returned (service stopped)");
+    Ok(())
+}
+
+/// Install as a Windows Service using `sc.exe`.
+pub fn install_service() -> Result<()> {
+    info!("Installing service {} via sc.exe", SERVICE_NAME);
+
+    let exe_path = std::env::current_exe()
+        .context("Failed to get current executable path")?
+        .to_string_lossy()
+        .to_string();
+
+    let bin_path = format!("\"{}\" service", exe_path);
+
+    let output = std::process::Command::new("sc")
+        .args([
+            "create",
+            SERVICE_NAME,
+            "binPath=",
+            &bin_path,
+            "start=",
+            "auto",
+            "DisplayName=",
+            SERVICE_DISPLAY_NAME,
+        ])
+        .output()
+        .context("Failed to run sc.exe create")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "sc.exe create failed (exit {}): {} {}",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
 
     info!("Service {} installed successfully", SERVICE_NAME);
+    info!("sc.exe output: {}", stdout.trim());
     Ok(())
 }
 
+/// Uninstall the Windows Service using `sc.exe`.
 pub fn uninstall_service() -> Result<()> {
-    info!("Uninstalling service {}", SERVICE_NAME);
+    info!("Uninstalling service {} via sc.exe", SERVICE_NAME);
 
-    let manager_access = windows_service::service_manager::ServiceManagerAccess::CONNECT;
-    let service_manager = windows_service::service_manager::ServiceManager::local_computer(None::<&str>, manager_access)?;
+    let _ = std::process::Command::new("sc")
+        .args(["stop", SERVICE_NAME])
+        .output();
 
-    let service_access = windows_service::service::ServiceAccess::DELETE
-        | windows_service::service::ServiceAccess::STOP;
+    let output = std::process::Command::new("sc")
+        .args(["delete", SERVICE_NAME])
+        .output()
+        .context("Failed to run sc.exe delete")?;
 
-    let service = service_manager
-        .open_service(SERVICE_NAME, service_access)
-        .context("Failed to open service")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Stop service if running
-    let _ = service.stop();
-
-    // Delete service
-    service.delete().context("Failed to delete service")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "sc.exe delete failed (exit {}): {} {}",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
 
     info!("Service {} uninstalled successfully", SERVICE_NAME);
-    Ok(())
-}
-
-pub fn start_service() -> Result<()> {
-    info!("Starting service {}", SERVICE_NAME);
-
-    let manager_access = windows_service::service_manager::ServiceManagerAccess::CONNECT;
-    let service_manager = windows_service::service_manager::ServiceManager::local_computer(None::<&str>, manager_access)?;
-
-    let service_access = windows_service::service::ServiceAccess::START;
-    let service = service_manager
-        .open_service(SERVICE_NAME, service_access)
-        .context("Failed to open service")?;
-
-    service.start(&[] as &[&str])
-        .context("Failed to start service")?;
-
-    info!("Service {} started successfully", SERVICE_NAME);
-    Ok(())
-}
-
-pub fn stop_service() -> Result<()> {
-    info!("Stopping service {}", SERVICE_NAME);
-
-    let manager_access = windows_service::service_manager::ServiceManagerAccess::CONNECT;
-    let service_manager = windows_service::service_manager::ServiceManager::local_computer(None::<&str>, manager_access)?;
-
-    let service_access = windows_service::service::ServiceAccess::STOP;
-    let service = service_manager
-        .open_service(SERVICE_NAME, service_access)
-        .context("Failed to open service")?;
-
-    service.stop()
-        .context("Failed to stop service")?;
-
-    info!("Service {} stopped successfully", SERVICE_NAME);
+    info!("sc.exe output: {}", stdout.trim());
     Ok(())
 }

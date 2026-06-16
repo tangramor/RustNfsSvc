@@ -153,119 +153,110 @@ impl NfsServer {
                 Ok((mut stream, addr)) => {
                     info!("Accepted TCP NFS connection from {}", addr);
 
-                    let mut buf = [0u8; 65536];
                     let v3_tcp = v3_server.clone();
                     let v4_tcp = v4_server.clone();
 
                     tokio::spawn(async move {
+                        // TCP is a byte stream, not message-based.
+                        // We must buffer incoming data and process complete NFS records.
+                        // NFS over TCP uses RFC 1831 record marking: 4-byte header per record.
+                        let mut recv_buf = Vec::with_capacity(65536);
+
                         loop {
-                            match stream.read(&mut buf).await {
-                                Ok(0) => {
-                                    info!("TCP connection closed by {}", addr);
+                            // Try to process all complete records already in the buffer
+                            while recv_buf.len() >= 4 {
+                                let record_marking = u32::from_be_bytes([
+                                    recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3],
+                                ]);
+                                let is_last_record = (record_marking & 0x80000000) != 0;
+                                let record_length = (record_marking & 0x7FFFFFFF) as usize;
+
+                                if !is_last_record {
+                                    warn!("Multi-record fragments not supported, discarding connection");
                                     break;
                                 }
-                                Ok(len) => {
-                                    info!("Received TCP NFS request from {} ({} bytes)", addr, len);
 
-                                    // TCP RPC over record marking: 4-byte header + RPC message
-                                    // Header: last flag (1 bit) | length (31 bits)
-                                    if len < 4 {
-                                        warn!("Invalid TCP RPC request: less than record marking header");
-                                        continue;
-                                    }
+                                if record_length < 20 {
+                                    warn!("Invalid RPC record length: {}, discarding 4 bytes", record_length);
+                                    recv_buf.drain(0..4);
+                                    continue;
+                                }
 
-                                    // Parse record marking header
-                                    let record_marking = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                                    let is_last_record = (record_marking & 0x80000000) != 0;
-                                    let record_length = (record_marking & 0x7FFFFFFF) as usize;
+                                let total_msg_len = 4 + record_length;
+                                if recv_buf.len() < total_msg_len {
+                                    // Incomplete record — need more data
+                                    break;
+                                }
 
-                                    if !is_last_record {
-                                        warn!("Multi-record fragments not supported");
-                                        continue;
-                                    }
+                                // Extract the complete record
+                                let record_data: Vec<u8> = recv_buf.drain(0..total_msg_len).collect();
+                                let rpc_data = &record_data[4..]; // skip record marking header
 
-                                    if len < 4 + record_length || record_length < 20 {
-                                        warn!("Invalid RPC record length: {} (total: {})", record_length, len);
-                                        continue;
-                                    }
+                                // Parse RPC header
+                                if rpc_data.len() < 20 {
+                                    continue;
+                                }
 
-                                    // RPC message starts after 4-byte record marking header
-                                    let rpc_offset = 4;
+                                let program = u32::from_be_bytes([
+                                    rpc_data[12], rpc_data[13], rpc_data[14], rpc_data[15],
+                                ]);
+                                let version = u32::from_be_bytes([
+                                    rpc_data[16], rpc_data[17], rpc_data[18], rpc_data[19],
+                                ]);
 
-                                    let _rpc_version = u32::from_be_bytes([buf[rpc_offset + 8], buf[rpc_offset + 9], buf[rpc_offset + 10], buf[rpc_offset + 11]]);
-                                    let program = u32::from_be_bytes([buf[rpc_offset + 12], buf[rpc_offset + 13], buf[rpc_offset + 14], buf[rpc_offset + 15]]);
-                                    let version = u32::from_be_bytes([buf[rpc_offset + 16], buf[rpc_offset + 17], buf[rpc_offset + 18], buf[rpc_offset + 19]]);
+                                info!("RPC header: program={}, version={}", program, version);
 
-                                    info!("RPC header: program={}, version={}", program, version);
-
-                                    if program == NFS_PROGRAM {
-                                        if version == NFS_V4 {
-                                            info!("Routing to NFS v4 TCP handler");
-                                            // Pass the RPC message part (after record marking)
-                                            if let Some(response) = v4_tcp.handle_request(&buf[rpc_offset..rpc_offset + record_length]).await {
-                                                // Add record marking header to response
-                                                // Format: last flag (1 bit) | length (31 bits)
-                                                let response_len = response.len() as u32;
-                                                let record_marking = 0x80000000 | response_len; // Set last fragment flag
-                                                let mut full_response = Vec::with_capacity(4 + response.len());
-                                                full_response.extend_from_slice(&record_marking.to_be_bytes());
-                                                full_response.extend_from_slice(&response);
-
-                                                let hex_str: Vec<String> = full_response.iter()
-                                                    .map(|b| format!("{:02x}", b))
-                                                    .collect();
-                                                debug!("Sending NFS v4 TCP response ({} bytes): {}", full_response.len(), hex_str.join(" "));
-
-                                                if let Err(e) = stream.write_all(&full_response).await {
-                                                    error!("Failed to send NFS v4 TCP response: {}", e);
-                                                    break;
-                                                }
-                                            }
-                                        } else if version == NFS_V3 {
-                                            info!("Routing to NFS v3 TCP handler");
-                                            // Pass the RPC message part (after record marking)
-                                            if let Some(response) = v3_tcp.handle_request(&buf[rpc_offset..rpc_offset + record_length], addr.ip()).await {
-                                                // Add record marking header to response
-                                                // Format: last flag (1 bit) | length (31 bits)
-                                                let response_len = response.len() as u32;
-                                                let record_marking = 0x80000000 | response_len; // Set last fragment flag
-                                                let mut full_response = Vec::with_capacity(4 + response.len());
-                                                full_response.extend_from_slice(&record_marking.to_be_bytes());
-                                                full_response.extend_from_slice(&response);
-
-                                                debug!("Sending NFS v3 TCP response ({} bytes)", full_response.len());
-                                                if let Err(e) = stream.write_all(&full_response).await {
-                                                    error!("Failed to send NFS v3 TCP response: {}", e);
-                                                    break;
-                                                }
-                                            }
-                                        } else {
-                                            warn!("Unsupported NFS version: {}", version);
-                                        }
-                                    } else if program == NFS_ACL_PROGRAM {
-                                        info!("NFS ACL program requested - not supported, returning error");
-                                        // Send RPC error response: procedure not supported
-                                        if let Some(response) = Self::make_rpc_error_reply(&buf[rpc_offset..rpc_offset + record_length], 1) {
-                                            // Add record marking header to response
-                                            let response_len = response.len() as u32;
-                                            let record_marking = 0x80000000 | response_len;
-                                            let mut full_response = Vec::with_capacity(4 + response.len());
-                                            full_response.extend_from_slice(&record_marking.to_be_bytes());
-                                            full_response.extend_from_slice(&response);
-
-                                            debug!("Sending NFS ACL error response ({} bytes)", full_response.len());
-                                            if let Err(e) = stream.write_all(&full_response).await {
-                                                error!("Failed to send NFS ACL error response: {}", e);
-                                                break;
-                                            }
-                                        }
+                                // Process the request
+                                let response_opt = if program == NFS_PROGRAM {
+                                    if version == NFS_V4 {
+                                        info!("Routing to NFS v4 TCP handler");
+                                        v4_tcp.handle_request(rpc_data).await
+                                    } else if version == NFS_V3 {
+                                        info!("Routing to NFS v3 TCP handler");
+                                        v3_tcp.handle_request(rpc_data, addr.ip()).await
                                     } else {
-                                        warn!("Unsupported RPC program: {}", program);
+                                        warn!("Unsupported NFS version: {}", version);
+                                        None
                                     }
+                                } else if program == NFS_ACL_PROGRAM {
+                                    info!("NFS ACL program requested - not supported, returning error");
+                                    Self::make_rpc_error_reply(rpc_data, 1)
+                                } else {
+                                    warn!("Unsupported RPC program: {}", program);
+                                    None
+                                };
+
+                                // Send response with record marking
+                                if let Some(response) = response_opt {
+                                    let response_len = response.len() as u32;
+                                    let rm = 0x80000000 | response_len; // last fragment flag
+                                    let mut full_response = Vec::with_capacity(4 + response.len());
+                                    full_response.extend_from_slice(&rm.to_be_bytes());
+                                    full_response.extend_from_slice(&response);
+
+                                    debug!("Sending NFS TCP response ({} bytes)", full_response.len());
+
+                                    if let Err(e) = stream.write_all(&full_response).await {
+                                        error!("Failed to send NFS TCP response: {}", e);
+                                        return; // drop connection
+                                    }
+                                }
+                            }
+
+                            // Read more data from the TCP stream
+                            let mut tmp = [0u8; 65536];
+                            match stream.read(&mut tmp).await {
+                                Ok(0) => {
+                                    info!("TCP connection closed by {}", addr);
+                                    return;
+                                }
+                                Ok(n) => {
+                                    info!("Received TCP data from {} ({} bytes, buffer now {})", addr, n, recv_buf.len() + n);
+                                    recv_buf.extend_from_slice(&tmp[..n]);
                                 }
                                 Err(e) => {
                                     error!("TCP read error from {}: {}", addr, e);
-                                    break;
+                                    return;
                                 }
                             }
                         }
