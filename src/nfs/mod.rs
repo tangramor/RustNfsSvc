@@ -18,6 +18,26 @@ const NFS_V3: u32 = 3;
 const NFS_V4: u32 = 4;
 const NFS_ACL_PROGRAM: u32 = 100227;
 
+// SEC-005: Maximum TCP receive buffer size (4 MB).
+// Prevents a malicious client from consuming unbounded memory
+// by sending partial records that never complete.
+const MAX_RECV_BUF: usize = 4 * 1024 * 1024;
+
+// SEC-009: Maximum single NFS record length (1 MB).
+// NFS over TCP record marking uses 31-bit length; in practice
+// a single COMPOUND should never exceed 1 MB.
+const MAX_RECORD_LENGTH: usize = 1024 * 1024;
+
+// SEC-008: Maximum number of operations in a single COMPOUND request.
+// Prevents CPU exhaustion from opcount=100000 style attacks.
+// Linux kernel NFS client typically sends ≤16 ops per COMPOUND.
+pub const MAX_OPS_PER_COMPOUND: usize = 64;
+
+// SEC-012: Maximum size for any single XDR opaque<> field.
+// Prevents integer overflow in `(len + 3) & !3` padding calculations
+// and limits memory allocation for untrusted length values.
+pub const MAX_XDR_OPAQUE: usize = 4 * 1024 * 1024; // 4MB
+
 pub struct NfsServer {
     exports: Arc<ExportsManager>,
 }
@@ -60,6 +80,17 @@ impl NfsServer {
         let exports_clone = Arc::clone(&self.exports);
         let nfs_protocol_server = protocol::NfsProtocolServer::new(exports_clone.clone());
         let nfs4_server = nfs4::Nfs4Server::new(exports_clone);
+
+        // SEC-011: Start background lease cleanup task (every 60 seconds)
+        let cleanup_server = nfs4_server.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                cleanup_server.cleanup_expired().await;
+            }
+        });
+
         tokio::spawn(async move {
             if let Err(e) = Self::start_unified_nfs(nfs_protocol_server, nfs4_server).await {
                 error!("NFS server error: {}", e);
@@ -182,6 +213,12 @@ impl NfsServer {
                                     continue;
                                 }
 
+                                // SEC-009: Reject oversized records
+                                if record_length > MAX_RECORD_LENGTH {
+                                    warn!("Oversized NFS record: {} bytes (max {}), dropping connection", record_length, MAX_RECORD_LENGTH);
+                                    return;
+                                }
+
                                 let total_msg_len = 4 + record_length;
                                 if recv_buf.len() < total_msg_len {
                                     // Incomplete record — need more data
@@ -253,6 +290,11 @@ impl NfsServer {
                                 Ok(n) => {
                                     info!("Received TCP data from {} ({} bytes, buffer now {})", addr, n, recv_buf.len() + n);
                                     recv_buf.extend_from_slice(&tmp[..n]);
+                                    // SEC-005: Drop connection if buffer exceeds maximum
+                                    if recv_buf.len() > MAX_RECV_BUF {
+                                        warn!("TCP recv buffer exceeded max ({} > {}), dropping connection from {}", recv_buf.len(), MAX_RECV_BUF, addr);
+                                        return;
+                                    }
                                 }
                                 Err(e) => {
                                     error!("TCP read error from {}: {}", addr, e);

@@ -189,6 +189,8 @@ struct ClientRecord {
     confirmed: bool,
     confirm_verifier: [u8; 8],
     sequence: u32,
+    /// SEC-011: Timestamp of last operation on this client
+    last_used: std::time::Instant,
 }
 
 /// Tracks an active NFSv4.1 session (created by CREATE_SESSION)
@@ -199,6 +201,8 @@ struct SessionRecord {
     highest_slot: u32,
     fore_max_ops: u32,
     fore_max_reqs: u32,
+    /// SEC-011: Timestamp of last SEQUENCE operation on this session
+    last_used: std::time::Instant,
 }
 
 /// Represents a byte-range lock held by a client
@@ -227,6 +231,11 @@ pub struct Nfs4Server {
     /// NFSv4.1 sessions: session_id -> SessionRecord
     sessions: Arc<RwLock<HashMap<Vec<u8>, SessionRecord>>>,
 }
+
+// SEC-011: Lease timeout for session/client cleanup.
+// NFSv4.1 spec recommends lease_time of at least 90 seconds.
+// We use 5 minutes to be generous with slow clients.
+const LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl Nfs4Server {
     pub fn new(exports: Arc<ExportsManager>) -> Self {
@@ -286,7 +295,7 @@ impl Nfs4Server {
         }
         debug!("NFS4 RPC hex dump ({} bytes total, showing first {}):{}", request.len(), dump_len, hex_lines);
 
-        // Parse cred + verifier
+        // Parse cred + verifier (SEC-012: integer overflow protection)
         let mut offset = 24;
         if request.len() < offset + 8 {
             return Some(make_rpc_accepted_reply(xid, ACC_SUCCESS, &self.make_compound_error(NFS4ERR_BADXDR)));
@@ -294,14 +303,38 @@ impl Nfs4Server {
         let cred_len = u32::from_be_bytes([
             request[offset+4], request[offset+5], request[offset+6], request[offset+7],
         ]) as usize;
-        offset += 8 + ((cred_len + 3) & !3);
+        // SEC-012: Prevent integer overflow in padding and reject oversized cred
+        if cred_len > crate::nfs::MAX_XDR_OPAQUE {
+            warn!("SEC-012: cred_len {} exceeds max, rejecting", cred_len);
+            return Some(make_rpc_accepted_reply(xid, 1, &[])); // GARBAGE_ARGS
+        }
+        let cred_padded = cred_len.checked_add(3).map(|v| v & !3);
+        match cred_padded {
+            Some(padded) => offset = offset.checked_add(8)?.checked_add(padded)?,
+            None => {
+                warn!("SEC-012: cred_len overflow in padding calculation");
+                return Some(make_rpc_accepted_reply(xid, 1, &[]));
+            }
+        };
         if request.len() < offset + 8 {
             return Some(make_rpc_accepted_reply(xid, ACC_SUCCESS, &self.make_compound_error(NFS4ERR_BADXDR)));
         }
         let verif_len = u32::from_be_bytes([
             request[offset+4], request[offset+5], request[offset+6], request[offset+7],
         ]) as usize;
-        offset += 8 + ((verif_len + 3) & !3);
+        // SEC-012: Prevent integer overflow in padding and reject oversized verif
+        if verif_len > crate::nfs::MAX_XDR_OPAQUE {
+            warn!("SEC-012: verif_len {} exceeds max, rejecting", verif_len);
+            return Some(make_rpc_accepted_reply(xid, 1, &[]));
+        }
+        let verif_padded = verif_len.checked_add(3).map(|v| v & !3);
+        match verif_padded {
+            Some(padded) => offset = offset.checked_add(8)?.checked_add(padded)?,
+            None => {
+                warn!("SEC-012: verif_len overflow in padding calculation");
+                return Some(make_rpc_accepted_reply(xid, 1, &[]));
+            }
+        };
 
         match procedure {
             0 => {
@@ -332,13 +365,22 @@ impl Nfs4Server {
             return self.make_compound_error(NFS4ERR_BADXDR);
         }
         let tag_len = u32::from_be_bytes([request[p], request[p+1], request[p+2], request[p+3]]) as usize;
+        // SEC-012: Limit tag length to prevent overflow
+        if tag_len > crate::nfs::MAX_XDR_OPAQUE {
+            warn!("SEC-012: tag_len {} exceeds max, rejecting", tag_len);
+            return self.make_compound_error(NFS4ERR_BADXDR);
+        }
         p += 4;
         let tag_bytes = if p + tag_len <= request.len() {
             request[p..p+tag_len].to_vec()
         } else {
             return self.make_compound_error(NFS4ERR_BADXDR);
         };
-        p += (tag_len + 3) & !3;
+        // SEC-012: Use checked_add for padding
+        p += match tag_len.checked_add(3) {
+            Some(v) => v & !3,
+            None => return self.make_compound_error(NFS4ERR_BADXDR),
+        };
 
         // minor_version
         if p + 4 > request.len() {
@@ -359,6 +401,12 @@ impl Nfs4Server {
         }
         let opcount = u32::from_be_bytes([request[p], request[p+1], request[p+2], request[p+3]]) as usize;
         p += 4;
+
+        // SEC-008: Limit the number of operations per COMPOUND to prevent CPU exhaustion
+        if opcount > crate::nfs::MAX_OPS_PER_COMPOUND {
+            warn!("NFS4 COMPOUND: opcount={} exceeds max {}, rejecting", opcount, crate::nfs::MAX_OPS_PER_COMPOUND);
+            return self.make_compound_error(NFS4ERR_RESOURCE);
+        }
 
         // Dump first 64 bytes of compound args to see opcodes
         let dump_end = std::cmp::min(args_start + 64, request.len());
@@ -927,10 +975,17 @@ impl Nfs4Server {
         };
 
         // Create file if needed
-        if opentype == OPEN4_CREATE && !file_path.exists() {
-            if let Err(e) = std::fs::File::create(&file_path) {
-                warn!("NFS4 OPEN create failed: {}", e);
-                return (vec![], consumed, None, None, NFS4ERR_IO);
+        if opentype == OPEN4_CREATE {
+            // SEC-002: Reject file creation on read-only exports
+            if self.exports.is_read_only(dir_fh).await {
+                warn!("NFS4 OPEN CREATE: rejected — export is read-only");
+                return (vec![], consumed, None, None, NFS4ERR_ROFS);
+            }
+            if !file_path.exists() {
+                if let Err(e) = std::fs::File::create(&file_path) {
+                    warn!("NFS4 OPEN create failed: {}", e);
+                    return (vec![], consumed, None, None, NFS4ERR_IO);
+                }
             }
         }
 
@@ -1092,6 +1147,12 @@ impl Nfs4Server {
             None => return (vec![], 0, None, None, NFS4ERR_NOFILEHANDLE),
             Some(fh) => fh,
         };
+
+        // SEC-002: Reject writes to read-only exports
+        if self.exports.is_read_only(fh).await {
+            warn!("NFS4 WRITE: rejected — export is read-only");
+            return (vec![], 0, None, None, NFS4ERR_ROFS);
+        }
 
         // stateid(16) + offset(8) + stable(4) + data opaque<>
         let mut pp = p;
@@ -1400,6 +1461,12 @@ impl Nfs4Server {
             None => return (vec![], 0, None, None, NFS4ERR_NOFILEHANDLE),
             Some(fh) => fh,
         };
+
+        // SEC-002: Reject removes on read-only exports
+        if self.exports.is_read_only(dir_fh).await {
+            warn!("NFS4 REMOVE: rejected — export is read-only");
+            return (vec![], 0, None, None, NFS4ERR_ROFS);
+        }
         if p + 4 > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
         let name_len = u32::from_be_bytes([request[p], request[p+1], request[p+2], request[p+3]]) as usize;
         let consumed = 4 + ((name_len + 3) & !3);
@@ -1448,6 +1515,14 @@ impl Nfs4Server {
             None => return (vec![], 0, None, None, NFS4ERR_RESTOREFH),
             Some(fh) => fh,
         };
+
+        // SEC-002: Reject renames on read-only exports
+        if let Some(cur_fh) = current_fh {
+            if self.exports.is_read_only(cur_fh).await {
+                warn!("NFS4 RENAME: rejected — export is read-only");
+                return (vec![], 0, None, None, NFS4ERR_ROFS);
+            }
+        }
         let dfh = match current_fh {
             None => return (vec![], 0, None, None, NFS4ERR_NOFILEHANDLE),
             Some(fh) => fh,
@@ -1511,6 +1586,12 @@ impl Nfs4Server {
             return (vec![], 0, None, None, NFS4ERR_NOFILEHANDLE);
         }
         let fh = current_fh.as_ref().unwrap();
+
+        // SEC-002: Reject setattr on read-only exports
+        if self.exports.is_read_only(fh).await {
+            warn!("NFS4 SETATTR: rejected — export is read-only");
+            return (vec![], 0, None, None, NFS4ERR_ROFS);
+        }
         
         // stateid(16) + attr bitmap + attr_vals
         let mut pp = p;
@@ -1673,6 +1754,12 @@ impl Nfs4Server {
             None => return (vec![], 0, None, None, NFS4ERR_NOFILEHANDLE),
             Some(fh) => fh,
         };
+
+        // SEC-002: Reject creates on read-only exports
+        if self.exports.is_read_only(dir_fh).await {
+            warn!("NFS4 CREATE: rejected — export is read-only");
+            return (vec![], 0, None, None, NFS4ERR_ROFS);
+        }
         let mut pp = p;
         // objtype (4)
         if pp + 4 > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
@@ -1839,6 +1926,7 @@ impl Nfs4Server {
                 confirmed: false,
                 confirm_verifier,
                 sequence: 0,
+                last_used: std::time::Instant::now(), // SEC-011
             });
         }
 
@@ -2108,7 +2196,7 @@ impl Nfs4Server {
         -> (Vec<u8>, usize, Option<Vec<u8>>, Option<Vec<u8>>, u32)
     {
         info!("NFS4 LINK");
-        
+
         let src_fh = match current_fh {
             None => return (vec![], 0, None, None, NFS4ERR_NOFILEHANDLE),
             Some(fh) => fh,
@@ -2117,6 +2205,12 @@ impl Nfs4Server {
             None => return (vec![], 0, None, None, NFS4ERR_NOFILEHANDLE),
             Some(fh) => fh,
         };
+
+        // SEC-002: Reject link on read-only exports
+        if self.exports.is_read_only(dir_fh).await {
+            warn!("NFS4 LINK: rejected — export is read-only");
+            return (vec![], 0, None, None, NFS4ERR_ROFS);
+        }
         
         // Parse new component name (opaque<>)
         let mut pp = p;
@@ -2521,6 +2615,8 @@ impl Nfs4Server {
             if pp + 4 > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
             let cred_len = u32::from_be_bytes([request[pp], request[pp+1], request[pp+2], request[pp+3]]) as usize;
             pp += 4;
+            // SEC-012: Prevent integer overflow
+            if cred_len > crate::nfs::MAX_XDR_OPAQUE { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
             if pp + cred_len > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
             pp += (cred_len + 3) & !3;
         }
@@ -2651,6 +2747,7 @@ impl Nfs4Server {
             confirmed: false,
             confirm_verifier: [0u8; 8],
             sequence: 1,
+            last_used: std::time::Instant::now(), // SEC-011
         });
 
         // Debug: log EXCHANGE_ID result bytes
@@ -2810,6 +2907,7 @@ impl Nfs4Server {
                 highest_slot: max_reqs - 1,
                 fore_max_ops: max_ops,
                 fore_max_reqs: max_reqs,
+                last_used: std::time::Instant::now(), // SEC-011
             });
             info!("NFS4 CREATE_SESSION: stored session, total sessions={}", sessions.len());
         }
@@ -2859,16 +2957,14 @@ impl Nfs4Server {
         info!("NFS4 BIND_CONN_TO_SESSION: dir={}, rdma={}, session_id[..4]={:02x}{:02x}{:02x}{:02x}",
             dir, rdma, session_id[0], session_id[1], session_id[2], session_id[3]);
 
-        // Validate session: accept leniently for stale/unknown sessions
-        // to avoid blocking mount recovery. The Linux kernel may retry
-        // BIND_CONN_TO_SESSION with a session_id from a previous server
-        // incarnation, and rejecting it can short-circuit the mount.
+        // SEC-010: Validate session strictly
         {
             let sessions = self.sessions.read().await;
             if sessions.contains_key(session_id) {
                 info!("NFS4 BIND_CONN_TO_SESSION: known session, {} active", sessions.len());
             } else {
-                info!("NFS4 BIND_CONN_TO_SESSION: lenient accept (unknown session, {} active)", sessions.len());
+                warn!("NFS4 BIND_CONN_TO_SESSION: unknown session, rejecting (SEC-010 strict mode)");
+                return (vec![], 24, None, None, NFS4ERR_BADSESSION);
             }
         }
 
@@ -2925,11 +3021,11 @@ impl Nfs4Server {
         let slot_id = u32::from_be_bytes([request[p+20], request[p+21], request[p+22], request[p+23]]);
         let highest_slot_id = u32::from_be_bytes([request[p+24], request[p+25], request[p+26], request[p+27]]);
 
-        // Session validation: if we know this session, enforce seqid ordering.
-        // Unknown (stale) sessions are accepted leniently — the client will
-        // eventually re-establish via EXCHANGE_ID.  Strict BADSESSION rejection
-        // here can prevent NFSv4.1 mount because the Linux kernel may cache
-        // sessions across server restarts and fail to recover from BADSESSION.
+        // SEC-010: Strict session validation.
+        // Unknown sessions are rejected with NFS4ERR_BADSESSION.
+        // The client must re-establish via EXCHANGE_ID + CREATE_SESSION.
+        // (Previously lenient mode allowed unknown sessions, which bypassed
+        // session validation and could be exploited by attackers.)
         let echo_sid: &[u8];
         let echo_highest_slot;
         {
@@ -2945,6 +3041,7 @@ impl Nfs4Server {
                 let mut w = self.sessions.write().await;
                 if let Some(s) = w.get_mut(session_id) {
                     s.sequence = seq_id;
+                    s.last_used = std::time::Instant::now(); // SEC-011
                     if highest_slot_id > s.highest_slot {
                         s.highest_slot = highest_slot_id;
                     }
@@ -2956,11 +3053,10 @@ impl Nfs4Server {
                 info!("NFS4 SEQUENCE: OK (known session) seqid={} slot={}",
                     seq_id, slot_id);
             } else {
-                // Unknown session — lenient accept
-                echo_sid = session_id;
-                echo_highest_slot = highest_slot_id;
-                info!("NFS4 SEQUENCE: OK (lenient, unknown session) seqid={} slot={} active_sessions={}",
-                    seq_id, slot_id, sessions.len());
+                // SEC-010: Unknown session — strict rejection
+                warn!("NFS4 SEQUENCE: unknown session, rejecting (SEC-010 strict mode) active_sessions={}",
+                    sessions.len());
+                return (vec![], consumed, None, None, NFS4ERR_BADSESSION);
             }
         }
 
@@ -2985,6 +3081,56 @@ impl Nfs4Server {
     {
         info!("NFS4 RECLAIM_COMPLETE");
         (vec![], 4, None, None, NFS4_OK)
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // SEC-011: Lease cleanup — expire idle sessions and clients
+    // ──────────────────────────────────────────────────────────────────────────
+    /// Remove sessions and clients that have been idle longer than LEASE_TIMEOUT.
+    /// Should be called periodically (e.g. every 60 seconds) from a background task.
+    pub async fn cleanup_expired(&self) {
+        let now = std::time::Instant::now();
+
+        // Clean expired sessions
+        let expired_sessions: Vec<Vec<u8>> = {
+            let sessions = self.sessions.read().await;
+            sessions.iter()
+                .filter(|(_, s)| now.duration_since(s.last_used) > LEASE_TIMEOUT)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        if !expired_sessions.is_empty() {
+            let mut sessions = self.sessions.write().await;
+            for sid in &expired_sessions {
+                sessions.remove(sid);
+            }
+            info!("SEC-011: cleaned up {} expired sessions", expired_sessions.len());
+        }
+
+        // Clean expired clients (only those with no remaining sessions)
+        let expired_clients: Vec<u64> = {
+            let clients = self.clients.read().await;
+            let sessions = self.sessions.read().await;
+            let active_client_ids: std::collections::HashSet<u64> =
+                sessions.values().map(|s| s.client_id).collect();
+            clients.iter()
+                .filter(|(id, c)| {
+                    now.duration_since(c.last_used) > LEASE_TIMEOUT
+                        && !active_client_ids.contains(id)
+                })
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        if !expired_clients.is_empty() {
+            let mut clients = self.clients.write().await;
+            let mut owner_map = self.client_owner_map.write().await;
+            for cid in &expired_clients {
+                if let Some(record) = clients.remove(cid) {
+                    owner_map.remove(&record.id_string);
+                }
+            }
+            info!("SEC-011: cleaned up {} expired clients", expired_clients.len());
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────

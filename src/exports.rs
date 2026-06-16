@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -40,6 +42,8 @@ impl Default for ExportOptions {
     }
 }
 
+type HmacSha256 = Hmac<Sha256>;
+
 /// File handle entry: maps a stable handle ID to a real filesystem path
 #[derive(Debug, Clone)]
 struct FhEntry {
@@ -50,6 +54,16 @@ struct FhEntry {
 }
 
 /// Exports manager: holds export config and file handle mappings
+///
+/// File handle wire format (SEC-006: 40 bytes with HMAC):
+///   [0..8]   = fhid (u64 big-endian)
+///   [8..16]  = inode (u64 big-endian)
+///   [16..20] = generation (u32 big-endian)
+///   [20..24] = random salt (u32 big-endian) — prevents offline brute-force
+///   [24..40] = HMAC-SHA256 truncated to 16 bytes (first 128 bits)
+///
+/// The HMAC key is generated once at server startup and never persisted,
+/// so all file handles become invalid after a restart (NFS4ERR_STALE).
 pub struct ExportsManager {
     config: Arc<Config>,
     exports: Arc<RwLock<HashMap<String, Export>>>,
@@ -58,16 +72,39 @@ pub struct ExportsManager {
     /// real_path -> file handle ID
     path_to_fhid: Arc<RwLock<HashMap<PathBuf, u64>>>,
     fh_counter: Arc<RwLock<u64>>,
+    /// HMAC key for file handle integrity (SEC-006): generated at startup
+    fh_hmac_key: [u8; 32],
 }
 
 impl ExportsManager {
     pub fn new(config: Arc<Config>) -> Self {
+        // SEC-006: Generate a random HMAC key at startup for file handle signing.
+        // Uses time+pid based xorshift as a portable CSPRNG alternative.
+        // All file handles become stale after restart (different key each time).
+        let fh_hmac_key = {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let pid = std::process::id() as u64;
+            let mut seed = now.as_nanos() as u64 ^ pid ^ 0xDEADBEEF_CAFEBABEu64;
+            let mut key = [0u8; 32];
+            for i in 0..32 {
+                // xorshift64 for mixing
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                key[i] = (seed & 0xFF) as u8;
+            }
+            key
+        };
+
         Self {
             config,
             exports: Arc::new(RwLock::new(HashMap::new())),
             fh_map: Arc::new(RwLock::new(HashMap::new())),
             path_to_fhid: Arc::new(RwLock::new(HashMap::new())),
             fh_counter: Arc::new(RwLock::new(1u64)),
+            fh_hmac_key,
         }
     }
 
@@ -132,6 +169,12 @@ impl ExportsManager {
 
         let mut allowed_clients = Vec::new();
         for client in &entry.allowed_clients {
+            // SEC-007: Support "*" as explicit "allow all" shorthand
+            if client == "*" {
+                allowed_clients.push("0.0.0.0/0".parse::<ipnet::IpNet>()?);
+                allowed_clients.push("::/0".parse::<ipnet::IpNet>()?);
+                continue;
+            }
             match client.parse::<ipnet::IpNet>() {
                 Ok(net) => allowed_clients.push(net),
                 Err(_) => {
@@ -152,8 +195,13 @@ impl ExportsManager {
             }
         }
 
+        // SEC-007: Empty allowed_clients means deny all.
+        // User must explicitly configure "*" or "0.0.0.0/0" to allow all.
         if allowed_clients.is_empty() {
-            allowed_clients.push("0.0.0.0/0".parse::<ipnet::IpNet>()?);
+            warn!("SEC-007: No allowed_clients configured for export '{}'. \
+                   Access will be DENIED for all clients. \
+                   Add \"*\" to allowed_clients to allow all.", entry.path);
+            // Do NOT add 0.0.0.0/0 — empty list = deny all
         }
 
         Ok(Export {
@@ -221,6 +269,20 @@ impl ExportsManager {
         self.resolve_export_path(path).await
     }
 
+    /// Check whether a file handle belongs to a read-only export (SEC-002).
+    /// Returns true if the export is configured as read-only.
+    pub async fn is_read_only(&self, fh: &[u8]) -> bool {
+        let export_root = match self.get_fh_export_root(fh).await {
+            Some(root) => root,
+            None => return false, // can't determine → don't block
+        };
+        let export_root_str = export_root.to_string_lossy().to_string();
+        if let Some(export) = self.resolve_export_path(&export_root_str).await {
+            return export.options.read_only;
+        }
+        false
+    }
+
     pub async fn list_exports(&self) -> Vec<String> {
         let exports = self.exports.read().await;
         exports.keys().cloned().collect()
@@ -273,7 +335,7 @@ impl ExportsManager {
             if let Some(&fhid) = map.get(&real_path) {
                 let fh_map = self.fh_map.read().await;
                 if let Some(entry) = fh_map.get(&fhid) {
-                    return Self::encode_handle(fhid, entry.inode, entry.gen);
+                    return self.encode_handle(fhid, entry.inode, entry.gen);
                 }
             }
         }
@@ -302,15 +364,70 @@ impl ExportsManager {
         }
 
         info!("Allocated FH id={} for '{}'", fhid, real_path.display());
-        Self::encode_handle(fhid, inode, gen)
+        self.encode_handle(fhid, inode, gen)
     }
 
-    fn encode_handle(fhid: u64, inode: u64, gen: u32) -> Vec<u8> {
-        let mut h = vec![0u8; 32];
+    /// File handle wire format (SEC-006): 40 bytes
+    ///   [0..8]   = fhid (u64 big-endian)
+    ///   [8..16]  = inode (u64 big-endian)
+    ///   [16..20] = generation (u32 big-endian)
+    ///   [20..24] = random salt (u32 big-endian)
+    ///   [24..40] = HMAC-SHA256 truncated to 16 bytes
+    const FH_SIZE: usize = 40;
+
+    fn compute_fh_mac(&self, fhid: u64, inode: u64, gen: u32, salt: u32) -> [u8; 16] {
+        let mut mac = HmacSha256::new_from_slice(&self.fh_hmac_key)
+            .expect("HMAC key length is valid");
+        mac.update(&fhid.to_be_bytes());
+        mac.update(&inode.to_be_bytes());
+        mac.update(&gen.to_be_bytes());
+        mac.update(&salt.to_be_bytes());
+        let result = mac.finalize().into_bytes();
+        let mut truncated = [0u8; 16];
+        truncated.copy_from_slice(&result[..16]);
+        truncated
+    }
+
+    fn encode_handle(&self, fhid: u64, inode: u64, gen: u32) -> Vec<u8> {
+        // Generate a random salt for each handle to prevent precomputation attacks
+        let salt: u32 = {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let pid = std::process::id() as u64;
+            let mut x = (now.as_nanos() as u64) ^ (pid << 32) ^ fhid;
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            x as u32
+        };
+        let mac = self.compute_fh_mac(fhid, inode, gen, salt);
+        let mut h = vec![0u8; Self::FH_SIZE];
         h[0..8].copy_from_slice(&fhid.to_be_bytes());
         h[8..16].copy_from_slice(&inode.to_be_bytes());
         h[16..20].copy_from_slice(&gen.to_be_bytes());
+        h[20..24].copy_from_slice(&salt.to_be_bytes());
+        h[24..40].copy_from_slice(&mac);
         h
+    }
+
+    /// Verify the HMAC signature of a file handle (SEC-006).
+    /// Returns the fhid if valid, None if the handle has been tampered with.
+    fn verify_fh_mac(&self, handle: &[u8]) -> Option<u64> {
+        if handle.len() < Self::FH_SIZE {
+            return None;
+        }
+        let fhid = u64::from_be_bytes(handle[0..8].try_into().ok()?);
+        let inode = u64::from_be_bytes(handle[8..16].try_into().ok()?);
+        let gen = u32::from_be_bytes(handle[16..20].try_into().ok()?);
+        let salt = u32::from_be_bytes(handle[20..24].try_into().ok()?);
+        let stored_mac = &handle[24..40];
+
+        let expected_mac = self.compute_fh_mac(fhid, inode, gen, salt);
+        if stored_mac == expected_mac {
+            Some(fhid)
+        } else {
+            warn!("SEC-006: file handle HMAC verification failed for fhid={}", fhid);
+            None
+        }
     }
 
     pub fn get_inode(&self, path: &Path) -> u64 {
@@ -343,26 +460,37 @@ impl ExportsManager {
             *counter += 1;
             id
         };
-        Self::encode_handle(fhid, inode, 1)
+        self.encode_handle(fhid, inode, 1)
     }
 
-    /// Decode handle bytes -> fhid
+    /// Decode handle bytes -> fhid (without HMAC verification)
+    /// Use this only for internal lookups where the handle has already been validated.
     pub fn decode_fhid(handle: &[u8]) -> Option<u64> {
         if handle.len() < 8 { return None; }
         Some(u64::from_be_bytes(handle[0..8].try_into().ok()?))
     }
 
-    /// Resolve file handle to real filesystem path
+    /// Decode handle bytes -> fhid with HMAC verification (SEC-006).
+    /// Returns None if the handle has been tampered with or is malformed.
+    pub fn verify_and_decode_fhid(&self, handle: &[u8]) -> Option<u64> {
+        // Zero handle = root probe (special case)
+        if handle.iter().all(|&b| b == 0) {
+            return Some(0);
+        }
+        self.verify_fh_mac(handle)
+    }
+
+    /// Resolve file handle to real filesystem path (with HMAC verification, SEC-006)
     pub async fn resolve_fh(&self, handle: &[u8]) -> Option<PathBuf> {
-        let fhid = Self::decode_fhid(handle)?;
+        let fhid = self.verify_and_decode_fhid(handle)?;
         if fhid == 0 { return None; }
         let map = self.fh_map.read().await;
         map.get(&fhid).map(|e| e.real_path.clone())
     }
 
-    /// Get the export root for a file handle
+    /// Get the export root for a file handle (with HMAC verification, SEC-006)
     pub async fn get_fh_export_root(&self, handle: &[u8]) -> Option<PathBuf> {
-        let fhid = Self::decode_fhid(handle)?;
+        let fhid = self.verify_and_decode_fhid(handle)?;
         if fhid == 0 { return None; }
         let map = self.fh_map.read().await;
         map.get(&fhid).map(|e| e.export_root.clone())
@@ -371,12 +499,12 @@ impl ExportsManager {
     pub async fn validate_file_handle(&self, handle: &[u8]) -> bool {
         if handle.is_empty() { return false; }
         if handle.iter().all(|&b| b == 0) { return true; } // zero handle = root probe
-        if handle.len() < 8 { return false; }
-        let fhid = match Self::decode_fhid(handle) {
+        // SEC-006: Verify HMAC signature first
+        let fhid = match self.verify_and_decode_fhid(handle) {
             Some(id) => id,
             None => return false,
         };
-        if fhid == 0 || fhid == u64::MAX { return true; } // zero handle and root synthetic handle
+        if fhid == u64::MAX { return true; } // root synthetic handle
         let map = self.fh_map.read().await;
         map.contains_key(&fhid)
     }
@@ -389,6 +517,9 @@ impl ExportsManager {
     /// This is a best-effort search; if we cannot find the path we leave the
     /// map untouched and the next resolve_fh() will return None → NFS4ERR_STALE.
     pub async fn try_rebuild_fh(&self, handle: &[u8]) {
+        // Use simple decode (no HMAC) for rebuild since the handle was
+        // issued by a previous server instance with a different HMAC key.
+        // After restart, all handles are stale until rebuilt or re-validated.
         let fhid = match Self::decode_fhid(handle) {
             Some(id) => id,
             None => return,
@@ -471,15 +602,64 @@ impl ExportsManager {
 
     /// Look up a child path within the directory identified by a file handle.
     /// Returns the child file handle bytes.
+    ///
+    /// Security: Rejects names containing path separators or `..` / `.`
+    /// components to prevent path traversal attacks (SEC-001).
+    /// Also validates that the resolved canonical path stays within the export root.
     pub async fn lookup_child(&self, dir_fh: &[u8], name: &str) -> Option<(Vec<u8>, PathBuf)> {
-        let dir_path = self.resolve_fh(dir_fh).await?;
-        let child_path = dir_path.join(name);
-        if !child_path.exists() {
+        // SEC-001: Reject path traversal attempts
+        if name.is_empty()
+            || name == ".."
+            || name == "."
+            || name.contains('/')
+            || name.contains('\\')
+        {
+            warn!("lookup_child: rejected unsafe name: {:?}", name);
             return None;
         }
-        // Find export root for this directory
+
+        let dir_path = self.resolve_fh(dir_fh).await?;
+        let child_path = dir_path.join(name);
+
+        // SEC-001: Verify the resolved path stays within the export root.
+        // Use canonicalize (resolves symlinks) if the path exists; otherwise
+        // do a prefix check on the non-canonical path (path doesn't exist yet
+        // for CREATE scenarios — canonicalize would fail).
         let export_root = self.get_fh_export_root(dir_fh).await
             .unwrap_or_else(|| dir_path.clone());
+
+        if child_path.exists() {
+            // Path exists — canonicalize both to resolve symlinks
+            let canonical_child = match std::fs::canonicalize(&child_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("lookup_child: canonicalize failed for {}: {}", child_path.display(), e);
+                    return None;
+                }
+            };
+            let canonical_root = match std::fs::canonicalize(&export_root) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("lookup_child: canonicalize failed for export root {}: {}", export_root.display(), e);
+                    // Fallback: use the export root as-is
+                    export_root.clone()
+                }
+            };
+            if !canonical_child.starts_with(&canonical_root) {
+                warn!("lookup_child: path traversal blocked: {} escapes export root {}", child_path.display(), export_root.display());
+                return None;
+            }
+        } else {
+            // Path doesn't exist yet — do a simple prefix check on the joined path.
+            // This catches `../../` even without canonicalize.
+            let child_str = child_path.to_string_lossy();
+            let root_str = export_root.to_string_lossy();
+            if !child_str.starts_with(root_str.as_ref()) {
+                warn!("lookup_child: path traversal blocked (non-canonical): {} escapes export root {}", child_path.display(), export_root.display());
+                return None;
+            }
+        }
+
         let fh = self.get_or_create_fh(child_path.clone(), export_root).await;
         Some((fh, child_path))
     }

@@ -56,18 +56,42 @@ impl NfsProtocolServer {
 
         let procedure = u32::from_be_bytes([request[20], request[21], request[22], request[23]]);
 
-        // Parse credentials + verifier to get args offset
+        // Parse credentials + verifier to get args offset (SEC-012: overflow protection)
         let mut args_off = 24;
         if request.len() > args_off + 8 {
             let cred_len = u32::from_be_bytes([
                 request[args_off+4], request[args_off+5], request[args_off+6], request[args_off+7],
             ]) as usize;
-            args_off += 8 + ((cred_len + 3) & !3);
+            // SEC-012: Limit cred length
+            if cred_len > crate::nfs::MAX_XDR_OPAQUE {
+                warn!("SEC-012: NFS3 cred_len {} exceeds max, rejecting", cred_len);
+                return None;
+            }
+            let cred_padded = match cred_len.checked_add(3) {
+                Some(v) => v & !3,
+                None => return None,
+            };
+            args_off = match args_off.checked_add(8).and_then(|v| v.checked_add(cred_padded)) {
+                Some(v) => v,
+                None => return None,
+            };
             if request.len() > args_off + 8 {
                 let verif_len = u32::from_be_bytes([
                     request[args_off+4], request[args_off+5], request[args_off+6], request[args_off+7],
                 ]) as usize;
-                args_off += 8 + ((verif_len + 3) & !3);
+                // SEC-012: Limit verif length
+                if verif_len > crate::nfs::MAX_XDR_OPAQUE {
+                    warn!("SEC-012: NFS3 verif_len {} exceeds max, rejecting", verif_len);
+                    return None;
+                }
+                let verif_padded = match verif_len.checked_add(3) {
+                    Some(v) => v & !3,
+                    None => return None,
+                };
+                args_off = match args_off.checked_add(8).and_then(|v| v.checked_add(verif_padded)) {
+                    Some(v) => v,
+                    None => return None,
+                };
             }
         }
 
@@ -222,6 +246,15 @@ impl NfsProtocolServer {
 
     async fn handle_setattr(&self, xid: &[u8], request: &[u8], off: usize) -> Option<Vec<u8>> {
         let (fh_data, _) = self.parse_fh(request, off)?;
+
+        // SEC-002: Reject setattr on read-only exports
+        if self.exports.is_read_only(fh_data).await {
+            let mut r = self.make_rpc_reply(xid);
+            r.extend_from_slice(&NFS3ERR_ROFS.to_be_bytes());
+            r.extend_from_slice(&self.make_wcc_data());
+            return Some(r);
+        }
+
         let mut r = self.make_rpc_reply(xid);
         r.extend_from_slice(&NFS3_OK.to_be_bytes());
         r.extend_from_slice(&self.make_wcc_data());
@@ -333,6 +366,18 @@ impl NfsProtocolServer {
 
     async fn handle_write(&self, xid: &[u8], request: &[u8], off: usize) -> Option<Vec<u8>> {
         let (fh_data, fh_consumed) = self.parse_fh(request, off)?;
+
+        // SEC-002: Reject writes to read-only exports
+        if self.exports.is_read_only(fh_data).await {
+            let mut r = self.make_rpc_reply(xid);
+            r.extend_from_slice(&NFS3ERR_ROFS.to_be_bytes());
+            r.extend_from_slice(&self.make_wcc_data());
+            r.extend_from_slice(&0u32.to_be_bytes()); // count
+            r.extend_from_slice(&2u32.to_be_bytes()); // committed = FILE_SYNC
+            r.extend_from_slice(&[0u8; 8]);            // write verifier
+            return Some(r);
+        }
+
         let args_off = off + fh_consumed;
         if args_off + 20 > request.len() { return None; }
 
@@ -378,6 +423,15 @@ impl NfsProtocolServer {
 
     async fn handle_create(&self, xid: &[u8], request: &[u8], off: usize) -> Option<Vec<u8>> {
         let (dir_fh, fh_consumed) = self.parse_fh(request, off)?;
+
+        // SEC-002: Reject creates on read-only exports
+        if self.exports.is_read_only(dir_fh).await {
+            let mut r = self.make_rpc_reply(xid);
+            r.extend_from_slice(&NFS3ERR_ROFS.to_be_bytes());
+            r.extend_from_slice(&self.make_wcc_data());
+            return Some(r);
+        }
+
         let args_off = off + fh_consumed;
         if args_off + 4 > request.len() { return None; }
         let name_len = u32::from_be_bytes([
@@ -411,6 +465,15 @@ impl NfsProtocolServer {
 
     async fn handle_mkdir(&self, xid: &[u8], request: &[u8], off: usize) -> Option<Vec<u8>> {
         let (dir_fh, fh_consumed) = self.parse_fh(request, off)?;
+
+        // SEC-002: Reject mkdir on read-only exports
+        if self.exports.is_read_only(dir_fh).await {
+            let mut r = self.make_rpc_reply(xid);
+            r.extend_from_slice(&NFS3ERR_ROFS.to_be_bytes());
+            r.extend_from_slice(&self.make_wcc_data());
+            return Some(r);
+        }
+
         let args_off = off + fh_consumed;
         if args_off + 4 > request.len() { return None; }
         let name_len = u32::from_be_bytes([
@@ -443,6 +506,15 @@ impl NfsProtocolServer {
 
     async fn handle_remove(&self, xid: &[u8], request: &[u8], off: usize) -> Option<Vec<u8>> {
         let (dir_fh, fh_consumed) = self.parse_fh(request, off)?;
+
+        // SEC-002: Reject removes on read-only exports
+        if self.exports.is_read_only(dir_fh).await {
+            let mut r = self.make_rpc_reply(xid);
+            r.extend_from_slice(&NFS3ERR_ROFS.to_be_bytes());
+            r.extend_from_slice(&self.make_wcc_data());
+            return Some(r);
+        }
+
         let args_off = off + fh_consumed;
         if args_off + 4 > request.len() { return None; }
         let name_len = u32::from_be_bytes([
@@ -467,6 +539,16 @@ impl NfsProtocolServer {
 
     async fn handle_rmdir(&self, xid: &[u8], request: &[u8], off: usize) -> Option<Vec<u8>> {
         let (dir_fh, fh_consumed) = self.parse_fh(request, off)?;
+
+        // SEC-002: Reject rmdir on read-only exports
+        if self.exports.is_read_only(dir_fh).await {
+            let mut r = self.make_rpc_reply(xid);
+            r.extend_from_slice(&NFS3ERR_ROFS.to_be_bytes());
+            r.extend_from_slice(&self.make_wcc_data());
+            r.extend_from_slice(&self.make_wcc_data());
+            return Some(r);
+        }
+
         let args_off = off + fh_consumed;
         if args_off + 4 > request.len() { return None; }
         let name_len = u32::from_be_bytes([
@@ -492,6 +574,16 @@ impl NfsProtocolServer {
 
     async fn handle_rename(&self, xid: &[u8], request: &[u8], off: usize) -> Option<Vec<u8>> {
         let (from_fh, fh1_consumed) = self.parse_fh(request, off)?;
+
+        // SEC-002: Reject renames on read-only exports
+        if self.exports.is_read_only(from_fh).await {
+            let mut r = self.make_rpc_reply(xid);
+            r.extend_from_slice(&NFS3ERR_ROFS.to_be_bytes());
+            r.extend_from_slice(&self.make_wcc_data());
+            r.extend_from_slice(&self.make_wcc_data());
+            return Some(r);
+        }
+
         let from_name_off = off + fh1_consumed;
         if from_name_off + 4 > request.len() { return None; }
         let from_name_len = u32::from_be_bytes([

@@ -186,6 +186,10 @@ pub fn run_service() -> Result<()> {
 }
 
 /// Install as a Windows Service using `sc.exe`.
+///
+/// SEC-013: By default, Windows services run as LocalSystem (highest privilege).
+/// This is dangerous for an NFS server that handles untrusted network input.
+/// We recommend creating a dedicated service account with minimal permissions.
 pub fn install_service() -> Result<()> {
     info!("Installing service {} via sc.exe", SERVICE_NAME);
 
@@ -196,17 +200,41 @@ pub fn install_service() -> Result<()> {
 
     let bin_path = format!("\"{}\" service", exe_path);
 
+    // SEC-013: Warn about LocalSystem and recommend a dedicated account.
+    // The user can pass account credentials via environment variables:
+    //   RUSTNFSSVC_SERVICE_ACCOUNT=.\SvcUser
+    //   RUSTNFSSVC_SERVICE_PASSWORD=Password123
+    let mut sc_args = vec![
+        "create".to_string(),
+        SERVICE_NAME.to_string(),
+        "binPath=".to_string(),
+        bin_path.clone(),
+        "start=".to_string(),
+        "auto".to_string(),
+        "DisplayName=".to_string(),
+        SERVICE_DISPLAY_NAME.to_string(),
+    ];
+
+    if let Ok(account) = std::env::var("RUSTNFSSVC_SERVICE_ACCOUNT") {
+        let password = std::env::var("RUSTNFSSVC_SERVICE_PASSWORD")
+            .unwrap_or_default();
+        info!("SEC-013: Using custom service account: {}", account);
+        sc_args.push("obj=".to_string());
+        sc_args.push(account);
+        sc_args.push("password=".to_string());
+        sc_args.push(password);
+    } else {
+        eprintln!("⚠️  SEC-013 WARNING: Service will run as LocalSystem (highest privilege).");
+        eprintln!("   This is a security risk for an NFS server handling untrusted network input.");
+        eprintln!("   To use a dedicated low-privilege account, set environment variables:");
+        eprintln!("     RUSTNFSSVC_SERVICE_ACCOUNT=.\\NfsService");
+        eprintln!("     RUSTNFSSVC_SERVICE_PASSWORD=<password>");
+        eprintln!("   Then run 'rustnfssvc install' again.");
+        eprintln!();
+    }
+
     let output = std::process::Command::new("sc")
-        .args([
-            "create",
-            SERVICE_NAME,
-            "binPath=",
-            &bin_path,
-            "start=",
-            "auto",
-            "DisplayName=",
-            SERVICE_DISPLAY_NAME,
-        ])
+        .args(&sc_args)
         .output()
         .context("Failed to run sc.exe create")?;
 

@@ -41,6 +41,10 @@ chrono = "0.4"
 # Cross-platform path handling
 path-clean = "1.0"
 
+# Cryptographic primitives for file handle HMAC (SEC-006)
+hmac = "0.12"
+sha2 = "0.10"
+
 # Network utilities
 ipnet = { version = "2.9", features = ["serde"] }
 
