@@ -26,6 +26,7 @@ RustNfsSvc/
 │   ├── config.rs            # Configuration loading and validation
 │   ├── exports.rs           # Export directory management and file handle resolution
 │   ├── logging.rs           # Log initialization and rotation
+│   ├── path_ext.rs          # Extended path handling (Windows-specific)
 │   └── nfs/
 │       ├── mod.rs           # Unified NFS server (TCP + UDP, v3 + v4)
 │       ├── nfs4.rs          # NFSv4.1 protocol implementation (~3350 lines)
@@ -103,6 +104,15 @@ listen_address = "0.0.0.0:2049"
 enable_v3 = true
 enable_v4 = true
 threads = 4
+bind_ip = "0.0.0.0"               # SEC-014
+max_connections = 128             # SEC-025
+max_conn_rate_per_ip = 10         # SEC-025
+enable_udp = true                 # SEC-026 (Suggest false for production)
+
+[tls]                             # SEC-015
+enabled = false
+cert_path = ""
+key_path = ""
 
 [[exports.entries]]
 path = "C:\\Shared"
@@ -115,6 +125,14 @@ level = "info"
 file = "C:\\ProgramData\\RustNfsSvc\\logs\\rustnfssvc.log"
 max_log_size_mb = 100
 max_log_files = 10
+```
+
+Administrator run the following command to enable the registry option to eliminate the path limit in combination with the manifest:
+
+```powershell
+New-ItemProperty `
+  -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+  -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force
 ```
 
 ### Export Options

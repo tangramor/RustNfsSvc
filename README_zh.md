@@ -26,6 +26,7 @@ RustNfsSvc/
 │   ├── config.rs            # 配置加载与验证
 │   ├── exports.rs           # 导出目录管理与文件句柄解析
 │   ├── logging.rs           # 日志初始化与轮转
+│   ├── path_ext.rs          # 扩展路径前缀（如 `\\?\`）
 │   └── nfs/
 │       ├── mod.rs           # 统一 NFS 服务器（TCP + UDP，v3 + v4）
 │       ├── nfs4.rs          # NFSv4.1 协议实现（约 3350 行）
@@ -103,6 +104,15 @@ listen_address = "0.0.0.0:2049"
 enable_v3 = true
 enable_v4 = true
 threads = 4
+bind_ip = "0.0.0.0"               # SEC-014
+max_connections = 128             # SEC-025
+max_conn_rate_per_ip = 10         # SEC-025
+enable_udp = true                 # SEC-026 (生产建议 false)
+
+[tls]                             # SEC-015
+enabled = false
+cert_path = ""
+key_path = ""
 
 [[exports.entries]]
 path = "C:\\Shared"
@@ -115,6 +125,14 @@ level = "info"
 file = "C:\\ProgramData\\RustNfsSvc\\logs\\rustnfssvc.log"
 max_log_size_mb = 100
 max_log_files = 10
+```
+
+管理员运行以下命令开启注册表选项，配合 manifest 彻底消除路径限制：
+
+```powershell
+New-ItemProperty `
+  -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+  -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force
 ```
 
 ### 导出选项
