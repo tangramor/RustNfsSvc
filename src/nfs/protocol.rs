@@ -1,5 +1,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
+
+use crate::path_ext::to_extended_path;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -180,7 +182,7 @@ impl NfsProtocolServer {
     // Build fattr3 from metadata
     // ──────────────────────────────────────────────────────────────────────────
     fn build_fattr3(&self, path: &PathBuf) -> Vec<u8> {
-        let meta = std::fs::metadata(path);
+        let meta = std::fs::metadata(to_extended_path(path));
         let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
         let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
         let mtime_secs = meta.ok()
@@ -354,7 +356,7 @@ impl NfsProtocolServer {
         let path = self.exports.resolve_fh(fh_data).await;
 
         let (data, eof) = if let Some(ref p) = path {
-            match std::fs::read(p) {
+            match std::fs::read(to_extended_path(p)) {
                 Ok(file_data) => {
                     let start = file_offset.min(file_data.len() as u64) as usize;
                     let end = (start + count).min(file_data.len());
@@ -422,7 +424,7 @@ impl NfsProtocolServer {
                 .read(true)
                 .write(true)
                 .create(true)
-                .open(p)
+                .open(to_extended_path(p))
             {
                 Ok(mut file) => {
                     use std::io::{Seek, SeekFrom};
@@ -483,7 +485,7 @@ impl NfsProtocolServer {
         let dir_path = self.exports.resolve_fh(dir_fh).await;
         if let Some(ref dp) = dir_path {
             let new_file = dp.join(&name);
-            let _ = std::fs::File::create(&new_file);
+            let _ = std::fs::File::create(to_extended_path(&new_file));
             let export_root = self.exports.get_fh_export_root(dir_fh).await
                 .unwrap_or_else(|| dp.clone());
             let new_fh = self.exports.get_or_create_fh(new_file.clone(), export_root).await;
@@ -525,7 +527,7 @@ impl NfsProtocolServer {
         let dir_path = self.exports.resolve_fh(dir_fh).await;
         if let Some(ref dp) = dir_path {
             let new_dir = dp.join(&name);
-            let _ = std::fs::create_dir_all(&new_dir);
+            let _ = std::fs::create_dir_all(to_extended_path(&new_dir));
             let export_root = self.exports.get_fh_export_root(dir_fh).await
                 .unwrap_or_else(|| dp.clone());
             let new_fh = self.exports.get_or_create_fh(new_dir.clone(), export_root).await;
@@ -567,7 +569,7 @@ impl NfsProtocolServer {
         let status = if let Some(ref dp) = dir_path {
             let target = dp.join(&name);
             if target.exists() {
-                if std::fs::remove_file(&target).is_ok() { NFS3_OK } else { NFS3ERR_IO }
+                if std::fs::remove_file(to_extended_path(&target)).is_ok() { NFS3_OK } else { NFS3ERR_IO }
             } else { NFS3ERR_NOENT }
         } else { NFS3ERR_STALE };
 
@@ -601,7 +603,7 @@ impl NfsProtocolServer {
         let status = if let Some(ref dp) = dir_path {
             let target = dp.join(&name);
             if target.exists() {
-                if std::fs::remove_dir(&target).is_ok() { NFS3_OK } else { NFS3ERR_NOTEMPTY }
+                if std::fs::remove_dir(to_extended_path(&target)).is_ok() { NFS3_OK } else { NFS3ERR_NOTEMPTY }
             } else { NFS3ERR_NOENT }
         } else { NFS3ERR_STALE };
 
@@ -652,7 +654,7 @@ impl NfsProtocolServer {
         let status = if let (Some(fd), Some(td)) = (from_dir, to_dir) {
             let src = fd.join(&from_name);
             let dst = td.join(&to_name);
-            if std::fs::rename(&src, &dst).is_ok() { NFS3_OK } else { NFS3ERR_IO }
+            if std::fs::rename(to_extended_path(&src), to_extended_path(&dst)).is_ok() { NFS3_OK } else { NFS3ERR_IO }
         } else { NFS3ERR_STALE };
 
         let mut r = self.make_rpc_reply(xid);
@@ -675,7 +677,7 @@ impl NfsProtocolServer {
             let export_root = self.exports.get_fh_export_root(fh_data).await
                 .unwrap_or_else(|| dir_path.clone());
 
-            if let Ok(entries) = std::fs::read_dir(dir_path) {
+            if let Ok(entries) = std::fs::read_dir(to_extended_path(dir_path)) {
                 for (idx, entry) in entries.flatten().enumerate() {
                     let name = entry.file_name().to_string_lossy().to_string();
                     let epath = entry.path();

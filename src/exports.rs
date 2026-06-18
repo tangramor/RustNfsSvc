@@ -10,6 +10,7 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use crate::config::{Config, ExportEntry};
+use crate::path_ext::to_extended_path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Export {
@@ -116,12 +117,14 @@ impl ExportsManager {
         for entry in &self.config.exports.entries {
             let export = self.parse_export_entry(entry)?;
 
-            if !export.path.exists() {
+            // Use extended path for existence / type checks to handle long paths (> MAX_PATH).
+            let check_path = to_extended_path(&export.path);
+            if !check_path.exists() {
                 warn!("Export path does not exist, skipping: {}", export.path.display());
                 continue;
             }
 
-            if !export.path.is_dir() {
+            if !check_path.is_dir() {
                 warn!("Export path is not a directory, skipping: {}", export.path.display());
                 continue;
             }
@@ -540,11 +543,12 @@ impl ExportsManager {
         // SEC-020: If the path is a symlink, verify it stays within export root.
         // Only check when the path exists (avoid overhead for non-existent paths).
         if real_path.exists() && real_path.is_symlink() {
-            let canonical = match std::fs::canonicalize(&real_path) {
+            // Use extended paths for canonicalize so it handles long-path symlinks correctly.
+            let canonical = match std::fs::canonicalize(to_extended_path(&real_path)) {
                 Ok(c) => c,
                 Err(_) => return Some(real_path), // can't verify, return as-is
             };
-            let canonical_root = match std::fs::canonicalize(&export_root) {
+            let canonical_root = match std::fs::canonicalize(to_extended_path(&export_root)) {
                 Ok(c) => c,
                 Err(_) => return Some(real_path), // can't verify, return as-is
             };
@@ -655,7 +659,7 @@ impl ExportsManager {
             return Some(dir.to_path_buf());
         }
         if depth >= max_depth { return None; }
-        let entries = std::fs::read_dir(dir).ok()?;
+        let entries = std::fs::read_dir(crate::path_ext::to_extended_path(dir)).ok()?;
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
             if fnv1a(&path) == target_inode {
@@ -699,15 +703,16 @@ impl ExportsManager {
             .unwrap_or_else(|| dir_path.clone());
 
         if child_path.exists() {
-            // Path exists — canonicalize both to resolve symlinks
-            let canonical_child = match std::fs::canonicalize(&child_path) {
+            // Path exists — canonicalize both to resolve symlinks.
+            // Use extended paths so canonicalize works on long paths too.
+            let canonical_child = match std::fs::canonicalize(to_extended_path(&child_path)) {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("lookup_child: canonicalize failed for {}: {}", child_path.display(), e);
                     return None;
                 }
             };
-            let canonical_root = match std::fs::canonicalize(&export_root) {
+            let canonical_root = match std::fs::canonicalize(to_extended_path(&export_root)) {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("lookup_child: canonicalize failed for export root {}: {}", export_root.display(), e);

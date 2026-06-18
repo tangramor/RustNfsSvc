@@ -5,6 +5,7 @@ mod config;
 mod exports;
 mod logging;
 mod nfs;
+mod path_ext;
 mod service;
 
 #[tokio::main]

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
+
+  <!-- Application identity -->
+  <assemblyIdentity
+    name="rustnfssvc"
+    version="1.0.0.0"
+    processorArchitecture="*"
+    type="win32"
+  />
+
+  <description>RustNfsSvc — Windows NFSv4.1 Server</description>
+
+  <!-- ─── Long Path Awareness ──────────────────────────────────────────────────
+       Declares that this application is aware of, and correctly handles,
+       paths longer than MAX_PATH (260 characters).
+
+       Requirements for this to take effect (Windows 10 build 1607 / RS1+):
+         HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled = 1  (DWORD)
+
+       With both conditions met, Win32 APIs (CreateFile, FindFirstFile, etc.)
+       and the C runtime will accept long paths without the \\?\ prefix.
+       ──────────────────────────────────────────────────────────────────────── -->
+  <asmv3:application>
+    <asmv3:windowsSettings
+      xmlns:ws2="http://schemas.microsoft.com/SMI/2016/WindowsSettings">
+      <ws2:longPathAware>true</ws2:longPathAware>
+    </asmv3:windowsSettings>
+  </asmv3:application>
+
+  <!-- ─── UAC / Execution Level ───────────────────────────────────────────────
+       requestedExecutionLevel = asInvoker:  run with caller's token.
+       The Windows Service host (services.exe) will already supply LocalSystem
+       or a configured low-privilege account; no elevation is requested here.
+       ──────────────────────────────────────────────────────────────────────── -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+</assembly>

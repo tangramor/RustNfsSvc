@@ -3,6 +3,24 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// Import path extension utilities for long-path support.
+// config.rs uses a path-local import because it cannot use `crate::path_ext`
+// (it is compiled as part of the binary crate but loaded early before other
+// modules are known).  We re-implement a tiny version inline.
+#[cfg(windows)]
+fn extended(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s.starts_with(r"\\?\") { return path.to_path_buf(); }
+    if path.is_absolute() {
+        PathBuf::from(format!(r"\\?\{}", s.replace('/', "\\")))
+    } else {
+        path.to_path_buf()
+    }
+}
+#[cfg(not(windows))]
+#[inline]
+fn extended(path: &Path) -> PathBuf { path.to_path_buf() }
+
 const DEFAULT_CONFIG_PATH: &str = "C:\\ProgramData\\RustNfsSvc\\config.toml";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,7 +297,7 @@ pub fn load_config() -> Result<Config> {
     // Win32 APIs; here we do a best-effort check.
     check_config_file_permissions(&config_path);
 
-    let config_content = fs::read_to_string(&config_path)
+    let config_content = fs::read_to_string(extended(&config_path))
         .with_context(|| format!("Failed to read config file from {}", config_path.display()))?;
 
     let config: Config = toml::from_str(&config_content)
@@ -324,12 +342,12 @@ pub fn create_default_config(config_path: &Path) -> Result<()> {
 
     // Create parent directories if they don't exist
     if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
+        fs::create_dir_all(extended(parent)).with_context(|| {
             format!("Failed to create config directory {}", parent.display())
         })?;
     }
 
-    fs::write(config_path, config_str).with_context(|| {
+    fs::write(extended(config_path), config_str).with_context(|| {
         format!("Failed to write config file to {}", config_path.display())
     })?;
 

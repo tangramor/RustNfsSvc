@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
 
 use crate::exports::ExportsManager;
+use crate::path_ext::to_extended_path;
 
 // ─── RPC constants ────────────────────────────────────────────────────────────
 const RPC_REPLY: u32 = 1;
@@ -1021,7 +1022,7 @@ impl Nfs4Server {
                 return (vec![], consumed, None, None, NFS4ERR_ROFS);
             }
             if !file_path.exists() {
-                if let Err(e) = std::fs::File::create(&file_path) {
+                if let Err(e) = std::fs::File::create(to_extended_path(&file_path)) {
                     warn!("NFS4 OPEN create failed: {}", e);
                     return (vec![], consumed, None, None, NFS4ERR_IO);
                 }
@@ -1149,8 +1150,8 @@ impl Nfs4Server {
             Some(p) => p,
         };
 
-        // Read file data
-        let data = match std::fs::read(&path) {
+        // Read file data — use extended path to handle files in long-path directories.
+        let data = match std::fs::read(to_extended_path(&path)) {
             Err(e) => {
                 warn!("NFS4 READ: failed to read {}: {}", path.display(), e);
                 return (vec![], consumed, None, None, NFS4ERR_IO);
@@ -1226,7 +1227,7 @@ impl Nfs4Server {
             .read(true)
             .write(true)
             .create(true)
-            .open(&path)
+            .open(to_extended_path(&path))
         {
             Ok(mut file) => {
                 use std::io::{Seek, SeekFrom};
@@ -1318,8 +1319,8 @@ impl Nfs4Server {
         let fh_preview: Vec<String> = fh.iter().take(8).map(|b| format!("{:02x}", b)).collect();
         debug!("NFS4 READDIR: fh_preview=[{}], dir_path='{}'", fh_preview.join(""), dir_path.display());
 
-        // Read directory entries
-        let entries = match std::fs::read_dir(&dir_path) {
+        // Read directory entries — use extended path for long-path directories.
+        let entries = match std::fs::read_dir(to_extended_path(&dir_path)) {
             Err(e) => {
                 warn!("NFS4 READDIR: failed to read dir {}: {}", dir_path.display(), e);
                 return (vec![], consumed, None, None, NFS4ERR_IO);
@@ -1540,7 +1541,7 @@ impl Nfs4Server {
 
         let res = if target.is_dir() {
             // Check if directory is non-empty per RFC 7530 §14.2.34
-            let dir_empty = match std::fs::read_dir(&target) {
+            let dir_empty = match std::fs::read_dir(to_extended_path(&target)) {
                 Ok(mut entries) => entries.next().is_none(),
                 Err(_) => false,
             };
@@ -1548,9 +1549,9 @@ impl Nfs4Server {
                 warn!("NFS4 REMOVE: directory not empty: {}", target.display());
                 return (vec![], consumed, None, None, NFS4ERR_NOTEMPTY);
             }
-            std::fs::remove_dir(&target)
+            std::fs::remove_dir(to_extended_path(&target))
         } else {
-            std::fs::remove_file(&target)
+            std::fs::remove_file(to_extended_path(&target))
         };
         if let Err(e) = res {
             warn!("NFS4 REMOVE failed: {}", e);
@@ -1619,7 +1620,7 @@ impl Nfs4Server {
             return (vec![], consumed, None, None, NFS4ERR_NOENT);
         }
 
-        if let Err(e) = std::fs::rename(&src, &dst) {
+        if let Err(e) = std::fs::rename(to_extended_path(&src), to_extended_path(&dst)) {
             warn!("NFS4 RENAME failed: {}", e);
             return (vec![], consumed, None, None, NFS4ERR_IO);
         }
@@ -1712,7 +1713,7 @@ impl Nfs4Server {
                         attr_data[attr_offset+4], attr_data[attr_offset+5], attr_data[attr_offset+6], attr_data[attr_offset+7],
                     ]);
                     attr_offset += 8;
-                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path) {
+                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(to_extended_path(&path)) {
                         if f.set_len(new_size).is_ok() {
                             bm0_set |= 1 << 4;
                             info!("NFS4 SETATTR: set size={} for {}", new_size, path.display());
@@ -1768,7 +1769,7 @@ impl Nfs4Server {
                         ]);
                         attr_offset += 12;
                         let new_time = std::time::UNIX_EPOCH + std::time::Duration::new(secs, nsecs);
-                        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path) {
+                        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(to_extended_path(&path)) {
                             if f.set_modified(new_time).is_ok() {
                                 bm1_set |= 1 << (54-32);
                                 info!("NFS4 SETATTR: set mtime for {}", path.display());
@@ -1777,7 +1778,7 @@ impl Nfs4Server {
                     } else {
                         // SET_TO_SERVER_TIME4: set to current time
                         let now = std::time::SystemTime::now();
-                        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path) {
+                        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(to_extended_path(&path)) {
                             if f.set_modified(now).is_ok() {
                                 bm1_set |= 1 << (54-32);
                                 info!("NFS4 SETATTR: set mtime to server time for {}", path.display());
@@ -1861,8 +1862,8 @@ impl Nfs4Server {
         }
 
         let create_res = match objtype {
-            NF4DIR => std::fs::create_dir(&new_path).map(|_| ()),
-            NF4REG => std::fs::File::create(&new_path).map(|_| ()),
+            NF4DIR => std::fs::create_dir(to_extended_path(&new_path)).map(|_| ()),
+            NF4REG => std::fs::File::create(to_extended_path(&new_path)).map(|_| ()),
             _ => return (vec![], consumed, None, None, NFS4ERR_BADTYPE),
         };
         if let Err(e) = create_res {
@@ -2112,7 +2113,7 @@ impl Nfs4Server {
             None => return (vec![], consumed, None, None, NFS4ERR_STALE),
             Some(p) => p,
         };
-        let meta = std::fs::metadata(&path).ok();
+        let meta = std::fs::metadata(to_extended_path(&path)).ok();
         
         // Re-parse the bitmap from the request to know which attrs were requested
         let mut bm_p = p + 4;
@@ -2318,8 +2319,8 @@ impl Nfs4Server {
         
         let target_path = dir_path.join(&new_name);
         
-        // Create hard link
-        match std::fs::hard_link(&src_path, &target_path) {
+        // Create hard link — extended paths required for long-path files.
+        match std::fs::hard_link(to_extended_path(&src_path), to_extended_path(&target_path)) {
             Ok(()) => info!("NFS4 LINK: created {}", target_path.display()),
             Err(e) => {
                 warn!("NFS4 LINK failed: {} -> {}: {}", src_path.display(), target_path.display(), e);
@@ -3217,7 +3218,7 @@ impl Nfs4Server {
     // ──────────────────────────────────────────────────────────────────────────
     async fn build_fattr4(&self, path: &Option<PathBuf>, requested_bitmap: &[u32], default_type: u32, is_root: bool) -> Vec<u8> {
         let path_str = path.as_ref().map(|p| p.to_string_lossy().to_string());
-        let meta = path.as_ref().and_then(|p| std::fs::metadata(p).ok());
+        let meta = path.as_ref().and_then(|p| std::fs::metadata(to_extended_path(p)).ok());
         debug!("NFS4 build_fattr4: path={:?}, meta={:?} (is_none={})", path_str, meta.is_some(), meta.is_none());
         // Debug: if meta is None, log the error
         // Determine which attrs we'll include
