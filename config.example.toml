@@ -20,7 +20,7 @@ max_connections = 128             # SEC-025
 
 max_conn_rate_per_ip = 60         # SEC-025 (NFS clients need multiple connections per mount)
 
-enable_udp = true                 # SEC-026 (Production suggest false)
+enable_udp = true                 # SEC-026 (生产建议 false)
 
 
 [tls]                             # SEC-015: TLS encryption for NFS traffic

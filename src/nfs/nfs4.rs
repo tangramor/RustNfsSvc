@@ -64,6 +64,21 @@ const OP_SECINFO_NO_NAME: u32 = 52; // RFC 5661 §18.45
 const OP_SEQUENCE: u32 = 53;       // RFC 5661 §18.46 — must be first op in each compound
 const OP_RECLAIM_COMPLETE: u32 = 58; // RFC 5661 §18.51
 
+// NFS v4.2 op codes (RFC 7862)
+const OP_ALLOCATE: u32 = 59;
+const OP_COPY: u32 = 60;
+const OP_COPY_NOTIFY: u32 = 61;
+const OP_DEALLOCATE: u32 = 62;
+const OP_IO_ADVISE: u32 = 63;
+const OP_LAYOUTERROR: u32 = 64;
+const OP_LAYOUTSTATS: u32 = 65;
+const OP_OFFLOAD_CANCEL: u32 = 66;
+const OP_OFFLOAD_STATUS: u32 = 67;
+const OP_READ_PLUS: u32 = 68;
+const OP_SEEK: u32 = 69;
+const OP_WRITE_SAME: u32 = 70;
+const OP_CLONE: u32 = 71;
+
 // ─── NFS4 status codes ────────────────────────────────────────────────────────
 const NFS4_OK: u32 = 0;
 const NFS4ERR_PERM: u32 = 1;
@@ -128,6 +143,13 @@ const NFS4ERR_ADMIN_REVOKED: u32 = 10047;
 const NFS4ERR_CB_PATH_DOWN: u32 = 10048;
 const NFS4ERR_BADSESSION: u32 = 10064;  // RFC 5661: session not found or invalid
 
+// NFSv4.2 error codes (RFC 7862)
+const NFS4ERR_UNION_NOTSUPP: u32 = 10028;  // RFC 7862 §13
+const NFS4ERR_PARTNER_NO_AUTH: u32 = 10029;
+const NFS4ERR_OFFLOAD_DENIED: u32 = 10030;
+const NFS4ERR_WRONG_LFS: u32 = 10031;
+const NFS4ERR_BADLABEL: u32 = 10032;
+
 // ─── NFS4 file types ─────────────────────────────────────────────────────────
 const NF4REG: u32 = 1;
 const NF4DIR: u32 = 2;
@@ -146,6 +168,7 @@ const FATTR4_NUMLINKS: u32 = 35 - 32;
 const FATTR4_OWNER: u32 = 36 - 32;
 const FATTR4_OWNER_GROUP: u32 = 37 - 32;
 const FATTR4_SPACE_USED: u32 = 45 - 32;
+const FATTR4_SPACE_FREED: u32 = 46 - 32; // NFSv4.2 (RFC 7862)
 const FATTR4_TIME_ACCESS: u32 = 47 - 32;
 const FATTR4_TIME_METADATA: u32 = 52 - 32;
 const FATTR4_TIME_MODIFY: u32 = 53 - 32;
@@ -413,8 +436,8 @@ impl Nfs4Server {
         let minor_version = u32::from_be_bytes([request[p], request[p+1], request[p+2], request[p+3]]);
         p += 4;
 
-        // We support minor versions 0 and 1 (NFSv4.0 and NFSv4.1)
-        if minor_version > 1 {
+        // We support minor versions 0, 1, and 2 (NFSv4.0, NFSv4.1, NFSv4.2)
+        if minor_version > 2 {
             info!("NFS4 COMPOUND: unsupported minor_version={}", minor_version);
             return self.make_compound_error(NFS4ERR_MINOR_VERS_MISMATCH);
         }
@@ -627,6 +650,18 @@ impl Nfs4Server {
             OP_ILLEGAL => {
                 warn!("NFS4 received OP_ILLEGAL in COMPOUND");
                 (vec![], 0, None, None, NFS4ERR_OP_ILLEGAL)
+            }
+            // ─── NFS v4.2 operations ────────────────────────────────────
+            OP_READ_PLUS => self.op_read_plus(request, p, current_fh).await,
+            OP_COPY => self.op_copy(request, p, current_fh, saved_fh).await,
+            OP_SEEK => self.op_seek(request, p, current_fh).await,
+            OP_CLONE => self.op_clone(request, p, current_fh, saved_fh).await,
+            OP_ALLOCATE | OP_DEALLOCATE | OP_IO_ADVISE |
+            OP_LAYOUTERROR | OP_LAYOUTSTATS |
+            OP_OFFLOAD_CANCEL | OP_OFFLOAD_STATUS |
+            OP_WRITE_SAME | OP_COPY_NOTIFY => {
+                debug!("NFS4.2 op {} not supported, returning NOTSUPP", opcode);
+                (vec![], 0, None, None, NFS4ERR_NOTSUPP)
             }
             _ => {
                 warn!("NFS4 unsupported op: {}", opcode);
@@ -2767,8 +2802,11 @@ impl Nfs4Server {
         //   2. (flags & EXCHGID4_FLAG_MASK_PNFS) != 0 (at least one pNFS role bit)
         const EXCHGID4_FLAG_CONFIRMED_R:  u32 = 0x80000000;
         const EXCHGID4_FLAG_USE_NON_PNFS: u32 = 0x00010000;
+        const EXCHGID4_FLAG_SUPP_MOVED_REFER: u32 = 0x00000001;
+        const EXCHGID4_FLAG_SUPP_MOVED_MIGR: u32 = 0x00000002;
 
-        let eir_flags = EXCHGID4_FLAG_CONFIRMED_R | EXCHGID4_FLAG_USE_NON_PNFS;
+        let eir_flags = EXCHGID4_FLAG_CONFIRMED_R | EXCHGID4_FLAG_USE_NON_PNFS
+            | EXCHGID4_FLAG_SUPP_MOVED_REFER | EXCHGID4_FLAG_SUPP_MOVED_MIGR;
 
         // Server scope (opaque<>) - empty
         let server_scope: Vec<u8> = vec![];
@@ -3260,6 +3298,7 @@ impl Nfs4Server {
             | (1 << (37-32))  // owner_group
             | (1 << (41-32))  // rawdev (RECOMMENDED, specdev4)
             | (1 << (45-32))  // space_used (RECOMMENDED)
+            | (1 << (46-32))  // space_freed (NFSv4.2, RFC 7862)
             | (1 << (47-32))  // time_access (RECOMMENDED)
             | (1 << (52-32))  // time_metadata
             | (1 << (53-32))  // time_modify
@@ -3459,6 +3498,13 @@ impl Nfs4Server {
             attr_vals.extend_from_slice(&used.to_be_bytes());
         }
 
+        // space_freed (bit 14 of word 1, abs bit 46) -> uint64 (NFSv4.2, RFC 7862)
+        // RECOMMENDED for NFSv4.2. Number of bytes freed if this file were removed.
+        // We don't truly compute this; return 0.
+        if bm1_actual & (1 << (46-32)) != 0 {
+            attr_vals.extend_from_slice(&0u64.to_be_bytes());
+        }
+
         // time_access (bit 15 of word 1, abs bit 47) -> nfstime4: seconds(8) + nseconds(4)
         // RECOMMENDED. Use last access time if available, fall back to modified time.
         if bm1_actual & (1 << (47-32)) != 0 {
@@ -3559,13 +3605,491 @@ impl Nfs4Server {
         body
     }
 
+    // ──────────────────────────────────────────────────────────────────────────
+    // NFS v4.2 Operations (RFC 7862)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// READ_PLUS — NFSv4.2 enhanced read with sparse hole support (RFC 7862 §18.6)
+    async fn op_read_plus(&self, request: &[u8], p: usize, current_fh: &Option<Vec<u8>>)
+        -> (Vec<u8>, usize, Option<Vec<u8>>, Option<Vec<u8>>, u32)
+    {
+        info!("NFS4 READ_PLUS");
+        let fh = match current_fh {
+            None => return (vec![], 28, None, None, NFS4ERR_NOFILEHANDLE),
+            Some(fh) => fh,
+        };
+
+        // stateid(16) + offset(8) + count(4) = 28 bytes
+        let consumed = 28;
+        if p + consumed > request.len() {
+            return (vec![], consumed, None, None, NFS4ERR_BADXDR);
+        }
+
+        let offset = u64::from_be_bytes([
+            request[p+16], request[p+17], request[p+18], request[p+19],
+            request[p+20], request[p+21], request[p+22], request[p+23],
+        ]);
+        let count = u32::from_be_bytes([
+            request[p+24], request[p+25], request[p+26], request[p+27],
+        ]) as usize;
+
+        info!("NFS4 READ_PLUS: offset={}, count={}", offset, count);
+
+        let path = match self.exports.resolve_fh(fh).await {
+            None => return (vec![], consumed, None, None, NFS4ERR_STALE),
+            Some(p) => p,
+        };
+
+        // Get file size from metadata first (avoids reading entire file)
+        let file_size = match std::fs::metadata(to_extended_path(&path)) {
+            Err(e) => {
+                warn!("NFS4 READ_PLUS: metadata error {}: {}", path.display(), e);
+                return (vec![], consumed, None, None, NFS4ERR_IO);
+            }
+            Ok(m) => m.len(),
+        };
+
+        let mut result = Vec::new();
+
+        // rpr_stateid — dummy all-zeros stateid (16 bytes)
+        let stateid = [0u8; 16];
+        result.extend_from_slice(&stateid);
+
+        if offset >= file_size {
+            // Beyond EOF → return HOLE
+            let readable: u32 = 0;
+            let eof: u32 = 1;
+            result.extend_from_slice(&readable.to_be_bytes());
+            result.extend_from_slice(&eof.to_be_bytes());
+            // content4_type = HOLE4_TYPE(1)
+            result.extend_from_slice(&1u32.to_be_bytes());
+            // hole4: h_offset(8) + h_length(4)
+            result.extend_from_slice(&offset.to_be_bytes());
+            result.extend_from_slice(&0u32.to_be_bytes()); // h_length = 0
+        } else {
+            // Read only the needed range (seek + read), not the entire file
+            let readable_len = (count as u64).min(file_size - offset) as usize;
+            let read_data = match std::fs::OpenOptions::new()
+                .read(true)
+                .open(to_extended_path(&path))
+            {
+                Ok(f) => {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut f = f;
+                    if let Err(e) = f.seek(SeekFrom::Start(offset)) {
+                        warn!("NFS4 READ_PLUS: seek error {}: {}", path.display(), e);
+                        return (vec![], consumed, None, None, NFS4ERR_IO);
+                    }
+                    let mut buf = vec![0u8; readable_len];
+                    match f.read(&mut buf) {
+                        Ok(n) => {
+                            buf.truncate(n);
+                            buf
+                        }
+                        Err(e) => {
+                            warn!("NFS4 READ_PLUS: read error {}: {}", path.display(), e);
+                            return (vec![], consumed, None, None, NFS4ERR_IO);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("NFS4 READ_PLUS: open error {}: {}", path.display(), e);
+                    return (vec![], consumed, None, None, NFS4ERR_IO);
+                }
+            };
+
+            let readable = read_data.len() as u32;
+            let eof: u32 = if (offset + read_data.len() as u64) >= file_size { 1 } else { 0 };
+
+            result.extend_from_slice(&readable.to_be_bytes());
+            result.extend_from_slice(&eof.to_be_bytes());
+            // content4_type = DATA4_TYPE(0)
+            result.extend_from_slice(&0u32.to_be_bytes());
+            // data4: d_offset(8) + d_length(4) + d_data opaque<>
+            result.extend_from_slice(&offset.to_be_bytes());
+            result.extend_from_slice(&readable.to_be_bytes());
+            result.extend_from_slice(&readable.to_be_bytes()); // d_data length
+            result.extend_from_slice(&read_data);
+            // XDR pad
+            let padded = (read_data.len() + 3) & !3;
+            let pad = padded - read_data.len();
+            result.resize(result.len() + pad, 0);
+        }
+
+        (result, consumed, None, None, NFS4_OK)
+    }
+
+    /// COPY — NFSv4.2 intra-server file copy (RFC 7862 §18.4)
+    async fn op_copy(&self, request: &[u8], p: usize, current_fh: &Option<Vec<u8>>, saved_fh: &Option<Vec<u8>>)
+        -> (Vec<u8>, usize, Option<Vec<u8>>, Option<Vec<u8>>, u32)
+    {
+        info!("NFS4 COPY");
+        let sink_fh = match current_fh {
+            None => return (vec![], 0, None, None, NFS4ERR_NOFILEHANDLE),
+            Some(fh) => fh,
+        };
+        // COPY uses saved_fh as the source file handle (RFC 7862 §18.4.3)
+        let source_fh = match saved_fh {
+            None => {
+                warn!("NFS4 COPY: no saved_fh (source file handle) available");
+                return (vec![], 0, None, None, NFS4ERR_NOFILEHANDLE);
+            }
+            Some(fh) => fh,
+        };
+
+        let mut pp = p;
+
+        // ca_source_stateid (16 bytes)
+        // ca_source_fh — the source is passed as current filehandle; we use saved_fh
+        // Actually, COPY expects source_fh in saved_fh and sink_fh in current_fh.
+        // For now, parse the args: stateid(16) + offset(8) + count(4)
+        if pp + 28 > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
+        pp += 16; // skip source stateid
+        let source_offset = u64::from_be_bytes([
+            request[pp], request[pp+1], request[pp+2], request[pp+3],
+            request[pp+4], request[pp+5], request[pp+6], request[pp+7],
+        ]);
+        pp += 8;
+        let count = u32::from_be_bytes([
+            request[pp], request[pp+1], request[pp+2], request[pp+3],
+        ]) as usize;
+        pp += 4;
+
+        // ca_sink_stateid (16 bytes)
+        if pp + 16 > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
+        pp += 16;
+
+        // ca_sink_offset (8 bytes)
+        if pp + 8 > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
+        let sink_offset = u64::from_be_bytes([
+            request[pp], request[pp+1], request[pp+2], request[pp+3],
+            request[pp+4], request[pp+5], request[pp+6], request[pp+7],
+        ]);
+        pp += 8;
+
+        // ca_source_server (netloc4) — parse netloc type
+        if pp + 4 > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
+        let netloc_type = u32::from_be_bytes([
+            request[pp], request[pp+1], request[pp+2], request[pp+3],
+        ]);
+        pp += 4;
+
+        // NL4_NAME=1, NL4_URL=2, NL4_NETADDR=3
+        // For inter-server: return NOTSUPP
+        // For intra-server (NL4_NETADDR local): continue
+        // For empty netloc (NL4_NETADDR with localhost): accepted
+        let consumed = pp - p;
+        match netloc_type {
+            3 => {
+                // NL4_NETADDR — parse addr string, but for intra-server we don't need to validate
+                if pp + 4 > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
+                let addr_len = u32::from_be_bytes([
+                    request[pp], request[pp+1], request[pp+2], request[pp+3],
+                ]) as usize;
+                pp += 4;
+                let padded = (addr_len + 3) & !3;
+                if pp + padded > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
+                pp += padded;
+            }
+            0 => {
+                // NL4_NULL/empty — acceptable
+            }
+            _ => {
+                debug!("NFS4 COPY: inter-server not supported, netloc_type={}", netloc_type);
+                return (vec![], consumed, None, None, NFS4ERR_NOTSUPP);
+            }
+        }
+
+        // ca_consecutive (4 bytes bool)
+        if pp + 4 > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
+        let _consecutive = u32::from_be_bytes([
+            request[pp], request[pp+1], request[pp+2], request[pp+3],
+        ]);
+        pp += 4;
+
+        // ca_synchronous (4 bytes bool)
+        if pp + 4 > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
+        let synchronous = u32::from_be_bytes([
+            request[pp], request[pp+1], request[pp+2], request[pp+3],
+        ]);
+        pp += 4;
+
+        let consumed = pp - p;
+
+        // COPY requires source_fh in saved_fh — get it from saved_fh (available in compound)
+        // But our handler signature doesn't have saved_fh. For now, we need to add saved_fh
+        // to the dispatch. Since the COPY handler is called from dispatch_op which DOES have
+        // saved_fh, we'll update the dispatch call to pass saved_fh.
+        // For now, return NFS4ERR_NOTSUPP for COPY — it requires saved_fh access.
+        // Actually, let's modify the approach: pass saved_fh to copy handler too.
+        // We'll handle this by calling COPY from the dispatch with saved_fh.
+        
+        info!("NFS4 COPY: source_offset={}, sink_offset={}, count={}", source_offset, sink_offset, count);
+
+        // Resolve sink path
+        let sink_path = match self.exports.resolve_fh(sink_fh).await {
+            None => return (vec![], consumed, None, None, NFS4ERR_BADHANDLE),
+            Some(p) => p,
+        };
+
+        // Resolve source path
+        let source_path = match self.exports.resolve_fh(source_fh).await {
+            None => return (vec![], consumed, None, None, NFS4ERR_BADHANDLE),
+            Some(p) => p,
+        };
+
+        // Read source data from source_offset
+        let source_data = match std::fs::read(to_extended_path(&source_path)) {
+            Err(e) => {
+                warn!("NFS4 COPY: failed to read source {}: {}", source_path.display(), e);
+                return (vec![], consumed, None, None, NFS4ERR_IO);
+            }
+            Ok(d) => d,
+        };
+
+        let source_len = source_data.len() as u64;
+        if source_offset > source_len {
+            return (vec![], consumed, None, None, NFS4ERR_INVAL);
+        }
+
+        let actual_count = count.min((source_len - source_offset) as usize);
+        let copy_data = &source_data[source_offset as usize..(source_offset as usize + actual_count)];
+
+        // Write to sink at sink_offset using OpenOptions + seek + write
+        let written = match std::fs::OpenOptions::new()
+            .write(true)
+            .open(to_extended_path(&sink_path))
+        {
+            Ok(f) => {
+                use std::io::{Seek, SeekFrom, Write};
+                let mut f = f;
+                if let Err(e) = f.seek(SeekFrom::Start(sink_offset)) {
+                    warn!("NFS4 COPY: seek error on sink {}: {}", sink_path.display(), e);
+                    return (vec![], consumed, None, None, NFS4ERR_IO);
+                }
+                match f.write_all(copy_data) {
+                    Ok(_) => actual_count as u32,
+                    Err(e) => {
+                        warn!("NFS4 COPY: write error on sink {}: {}", sink_path.display(), e);
+                        return (vec![], consumed, None, None, NFS4ERR_IO);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("NFS4 COPY: failed to open sink {}: {}", sink_path.display(), e);
+                return (vec![], consumed, None, None, NFS4ERR_IO);
+            }
+        };
+
+        // Build response — for synchronous copy
+        let mut result = Vec::new();
+        // cr_length(4) + cr_synchronous(4 bytes bool)
+        result.extend_from_slice(&written.to_be_bytes());
+        result.extend_from_slice(&1u32.to_be_bytes()); // always synchronous
+
+        info!("NFS4 COPY: copied {} bytes from offset {} to offset {}", written, source_offset, sink_offset);
+        (result, consumed, None, None, NFS4_OK)
+    }
+
+    /// SEEK — NFSv4.2 find next data or hole (RFC 7862 §18.19)
+    async fn op_seek(&self, request: &[u8], p: usize, current_fh: &Option<Vec<u8>>)
+        -> (Vec<u8>, usize, Option<Vec<u8>>, Option<Vec<u8>>, u32)
+    {
+        info!("NFS4 SEEK");
+        let fh = match current_fh {
+            None => return (vec![], 0, None, None, NFS4ERR_NOFILEHANDLE),
+            Some(fh) => fh,
+        };
+
+        // sa_stateid(16) + sa_offset(8) + sa_seek_type(4) = 28 bytes
+        let consumed = 28;
+        if p + consumed > request.len() {
+            return (vec![], consumed, None, None, NFS4ERR_BADXDR);
+        }
+
+        let seek_offset = u64::from_be_bytes([
+            request[p+16], request[p+17], request[p+18], request[p+19],
+            request[p+20], request[p+21], request[p+22], request[p+23],
+        ]);
+        let seek_type = u32::from_be_bytes([
+            request[p+24], request[p+25], request[p+26], request[p+27],
+        ]);
+
+        info!("NFS4 SEEK: offset={}, type={}", seek_offset, seek_type);
+
+        let path = match self.exports.resolve_fh(fh).await {
+            None => return (vec![], consumed, None, None, NFS4ERR_STALE),
+            Some(p) => p,
+        };
+
+        let file_size = match std::fs::metadata(to_extended_path(&path)) {
+            Err(e) => {
+                warn!("NFS4 SEEK: metadata error {}: {}", path.display(), e);
+                return (vec![], consumed, None, None, NFS4ERR_IO);
+            }
+            Ok(m) => m.len(),
+        };
+
+        // SEEK4_DATA = 0, SEEK4_HOLE = 1
+        match seek_type {
+            0 => {
+                // SEEK4_DATA: find next data after seek_offset
+                let mut result = Vec::new();
+                if seek_offset < file_size {
+                    // Data exists at seek_offset
+                    result.extend_from_slice(&seek_offset.to_be_bytes()); // sr_offset
+                    result.extend_from_slice(&(file_size - seek_offset).to_be_bytes()); // sr_length (till EOF)
+                    result.extend_from_slice(&0u32.to_be_bytes()); // sr_eof = false
+                } else {
+                    // Past EOF — no data
+                    result.extend_from_slice(&seek_offset.to_be_bytes()); // sr_offset
+                    result.extend_from_slice(&0u32.to_be_bytes()); // sr_length
+                    result.extend_from_slice(&1u32.to_be_bytes()); // sr_eof = true
+                }
+                (result, consumed, None, None, NFS4_OK)
+            }
+            1 => {
+                // SEEK4_HOLE: find next hole after seek_offset
+                let mut result = Vec::new();
+                if seek_offset < file_size {
+                    // On Windows without sparse detection, hole starts at file_size
+                    result.extend_from_slice(&file_size.to_be_bytes()); // sr_offset = EOF
+                    result.extend_from_slice(&0u32.to_be_bytes()); // sr_length
+                    result.extend_from_slice(&1u32.to_be_bytes()); // sr_eof = true
+                } else {
+                    // Past EOF
+                    result.extend_from_slice(&seek_offset.to_be_bytes());
+                    result.extend_from_slice(&0u32.to_be_bytes());
+                    result.extend_from_slice(&1u32.to_be_bytes());
+                }
+                (result, consumed, None, None, NFS4_OK)
+            }
+            _ => {
+                debug!("NFS4 SEEK: unknown seek_type={}", seek_type);
+                (vec![], consumed, None, None, NFS4ERR_INVAL)
+            }
+        }
+    }
+
+    /// CLONE — NFSv4.2 server-side clone (RFC 7862 §18.15.4)
+    /// Simplified implementation: read source range + write to sink (no BlockClone API)
+    async fn op_clone(&self, request: &[u8], p: usize, current_fh: &Option<Vec<u8>>, saved_fh: &Option<Vec<u8>>)
+        -> (Vec<u8>, usize, Option<Vec<u8>>, Option<Vec<u8>>, u32)
+    {
+        info!("NFS4 CLONE");
+        let sink_fh = match current_fh {
+            None => return (vec![], 0, None, None, NFS4ERR_NOFILEHANDLE),
+            Some(fh) => fh,
+        };
+        // CLONE uses saved_fh as the source file handle (RFC 7862 §18.15.4)
+        let source_fh = match saved_fh {
+            None => {
+                warn!("NFS4 CLONE: no saved_fh (source file handle) available");
+                return (vec![], 0, None, None, NFS4ERR_NOFILEHANDLE);
+            }
+            Some(fh) => fh,
+        };
+
+        let mut pp = p;
+
+        // cl_source_stateid (16 bytes)
+        if pp + 16 > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
+        pp += 16;
+
+        // cl_source_offset (8 bytes)
+        if pp + 8 > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
+        let source_offset = u64::from_be_bytes([
+            request[pp], request[pp+1], request[pp+2], request[pp+3],
+            request[pp+4], request[pp+5], request[pp+6], request[pp+7],
+        ]);
+        pp += 8;
+
+        // cl_count (4 bytes)
+        if pp + 4 > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
+        let count = u32::from_be_bytes([
+            request[pp], request[pp+1], request[pp+2], request[pp+3],
+        ]) as usize;
+        pp += 4;
+
+        // cl_sink_stateid (16 bytes)
+        if pp + 16 > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
+        pp += 16;
+
+        // cl_sink_offset (8 bytes)
+        if pp + 8 > request.len() { return (vec![], 0, None, None, NFS4ERR_BADXDR); }
+        let sink_offset = u64::from_be_bytes([
+            request[pp], request[pp+1], request[pp+2], request[pp+3],
+            request[pp+4], request[pp+5], request[pp+6], request[pp+7],
+        ]);
+        pp += 8;
+
+        let consumed = pp - p;
+
+        info!("NFS4 CLONE: source_offset={}, sink_offset={}, count={}", source_offset, sink_offset, count);
+
+        // Resolve source and sink paths
+        let source_path = match self.exports.resolve_fh(source_fh).await {
+            None => return (vec![], consumed, None, None, NFS4ERR_BADHANDLE),
+            Some(p) => p,
+        };
+        let sink_path = match self.exports.resolve_fh(sink_fh).await {
+            None => return (vec![], consumed, None, None, NFS4ERR_BADHANDLE),
+            Some(p) => p,
+        };
+
+        // Read source data from source_offset
+        let source_data = match std::fs::read(to_extended_path(&source_path)) {
+            Err(e) => {
+                warn!("NFS4 CLONE: failed to read source {}: {}", source_path.display(), e);
+                return (vec![], consumed, None, None, NFS4ERR_IO);
+            }
+            Ok(d) => d,
+        };
+
+        let source_len = source_data.len() as u64;
+        if source_offset > source_len {
+            return (vec![], consumed, None, None, NFS4ERR_INVAL);
+        }
+
+        let actual_count = count.min((source_len - source_offset) as usize);
+        let clone_data = &source_data[source_offset as usize..(source_offset as usize + actual_count)];
+
+        // Write to sink at sink_offset
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .open(to_extended_path(&sink_path))
+        {
+            Ok(f) => {
+                use std::io::{Seek, SeekFrom, Write};
+                let mut f = f;
+                if let Err(e) = f.seek(SeekFrom::Start(sink_offset)) {
+                    warn!("NFS4 CLONE: seek error on sink {}: {}", sink_path.display(), e);
+                    return (vec![], consumed, None, None, NFS4ERR_IO);
+                }
+                if let Err(e) = f.write_all(clone_data) {
+                    warn!("NFS4 CLONE: write error on sink {}: {}", sink_path.display(), e);
+                    return (vec![], consumed, None, None, NFS4ERR_IO);
+                }
+            }
+            Err(e) => {
+                warn!("NFS4 CLONE: failed to open sink {}: {}", sink_path.display(), e);
+                return (vec![], consumed, None, None, NFS4ERR_IO);
+            }
+        }
+
+        info!("NFS4 CLONE: cloned {} bytes from offset {} to offset {}", actual_count, source_offset, sink_offset);
+        (vec![], consumed, None, None, NFS4_OK)
+    }
+
     /// SEC-018: Check if an opcode is a write operation that should be
     /// blocked by root_squash when the caller is root (uid=0).
     fn is_write_opcode(opcode: u32) -> bool {
         matches!(opcode,
             OP_WRITE | OP_CREATE | OP_REMOVE | OP_RENAME |
             OP_SETATTR | OP_LINK | OP_OPEN | OP_LOCK |
-            OP_LOCKU | OP_CLOSE | OP_DELEGRETURN | OP_COMMIT
+            OP_LOCKU | OP_CLOSE | OP_DELEGRETURN | OP_COMMIT |
+            // NFSv4.2 write operations
+            OP_COPY | OP_CLONE | OP_ALLOCATE | OP_DEALLOCATE | OP_WRITE_SAME
         )
     }
 }
