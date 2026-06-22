@@ -141,7 +141,7 @@ fn default_max_connections() -> usize {
 }
 
 fn default_max_conn_rate_per_ip() -> usize {
-    10
+    60 // NFS clients open multiple TCP connections (portmap/mount/nfs) per mount; 10 is too low
 }
 
 fn default_enable_udp() -> bool {

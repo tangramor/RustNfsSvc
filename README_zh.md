@@ -14,6 +14,7 @@
 - **PORTMAP** — RPC 端口映射服务，端口 111（TCP + UDP）
 - **异步 I/O** — 基于 Tokio 构建，支持高并发
 - **灵活配置** — 基于 TOML 的配置文件，支持按导出目录的访问控制（CIDR）
+- **TLS 加密** — 内置 TLS 支持（rustls），加密 NFS 传输流量（SEC-015）
 - **结构化日志** — 滚动日志文件，可配置日志级别和轮转策略
 
 ## 项目结构
@@ -22,13 +23,13 @@
 RustNfsSvc/
 ├── src/
 │   ├── main.rs              # 入口：CLI 参数解析（install/uninstall/service/独立运行）
+│   ├── path_ext.rs          # Windows \\?\ 扩展路径辅助（MAX_PATH 修复）
 │   ├── service.rs           # Windows 服务生命周期（通过 sc.exe 安装/卸载，运行模式）
 │   ├── config.rs            # 配置加载与验证
 │   ├── exports.rs           # 导出目录管理与文件句柄解析
 │   ├── logging.rs           # 日志初始化与轮转
-│   ├── path_ext.rs          # 扩展路径前缀（如 `\\?\`）
 │   └── nfs/
-│       ├── mod.rs           # 统一 NFS 服务器（TCP + UDP，v3 + v4）
+│       ├── mod.rs           # 统一 NFS 服务器（TCP + UDP，v3 + v4，TLS）
 │       ├── nfs4.rs          # NFSv4.1 协议实现（约 3350 行）
 │       ├── protocol.rs      # NFSv3 协议实现
 │       ├── mount.rs         # MOUNT 协议（v1/v3）
@@ -104,15 +105,15 @@ listen_address = "0.0.0.0:2049"
 enable_v3 = true
 enable_v4 = true
 threads = 4
-bind_ip = "0.0.0.0"               # SEC-014
-max_connections = 128             # SEC-025
-max_conn_rate_per_ip = 10         # SEC-025
-enable_udp = true                 # SEC-026 (生产建议 false)
+bind_ip = "0.0.0.0"                # 绑定到特定 IP 以增强安全性
+max_connections = 128              # 全局并发连接上限
+max_conn_rate_per_ip = 60          # 单 IP 连接速率限制（每 60s 窗口）
+enable_udp = true                  # 启用 UDP（使用 TLS 时建议设为 false）
 
-[tls]                             # SEC-015
+[tls]                              # SEC-015：TLS 加密
 enabled = false
-cert_path = ""
-key_path = ""
+cert_path = ""                     # PEM 证书路径（启用时必填）
+key_path = ""                      # PEM 私钥路径（PKCS8 或 PKCS1 RSA 均可）
 
 [[exports.entries]]
 path = "C:\\Shared"
@@ -127,14 +128,6 @@ max_log_size_mb = 100
 max_log_files = 10
 ```
 
-管理员运行以下命令开启注册表选项，配合 manifest 彻底消除路径限制：
-
-```powershell
-New-ItemProperty `
-  -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
-  -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force
-```
-
 ### 导出选项
 
 | 选项 | 说明 |
@@ -146,6 +139,102 @@ New-ItemProperty `
 | `no_subtree_check` | 禁用子树检查（性能更好） |
 | `insecure` | 允许来自 ≥ 1024 端口的连接 |
 | `no_root_squash` | 允许 root 用户以 root 身份访问文件 |
+
+### TLS 加密配置
+
+RustNfsSvc 支持内置 TLS 加密 NFS TCP 流量。启用后，服务器使用 **rustls**（ring 后端）加密所有 NFS/MOUNT/PORTMAP TCP 连接。
+
+#### 启用 TLS
+
+1. **生成证书** — 为服务器创建 PEM 格式的证书和私钥：
+
+   ```bash
+   # 使用 OpenSSL
+   openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt -days 365 -nodes \
+     -subj "/CN=nfs-server" -addext "subjectAltName=IP:192.168.1.1"
+
+   # 将密钥转为 PKCS8 格式（rustls 推荐）
+   openssl pkcs8 -topk8 -nocrypt -in server.key -out server.key.pkcs8
+   ```
+
+2. **配置** — 编辑 `config.toml`：
+
+   ```toml
+   [tls]
+   enabled = true
+   cert_path = "C:/etc/rustnfssvc/server.crt"
+   key_path  = "C:/etc/rustnfssvc/server.key"    # 接受 PKCS8 或 PKCS1 RSA 格式
+   ```
+
+3. **禁用 UDP** — TLS 仅支持 TCP。启用 TLS 时设置 `enable_udp = false`。
+
+4. **重启服务** — 重启使 TLS 生效。
+
+#### 客户端使用 stunnel 挂载
+
+Linux NFS 客户端原生不支持 TLS。使用 **stunnel** 建立加密隧道：
+
+**在客户端（Linux）上：**
+
+1. 安装 stunnel：
+
+   ```bash
+   sudo apt install stunnel4    # Debian/Ubuntu
+   sudo yum install stunnel     # RHEL/CentOS
+   ```
+
+2. 创建 `/etc/stunnel/nfs.conf`：
+
+   ```ini
+   [nfs]
+   client = yes
+   accept = 127.0.0.1:2049
+   connect = <服务器IP>:2049
+   verifyChain = yes
+   CApath = /etc/ssl/certs
+   ; 或直接指定服务器证书：
+   ; CAfile = /path/to/server.crt
+   ```
+
+3. 启动 stunnel：
+
+   ```bash
+   sudo systemctl start stunnel4
+   ```
+
+4. 通过本地隧道挂载：
+
+   ```bash
+   sudo mount -t nfs4 -o vers=4,minorversion=1 127.0.0.1:/<别名> /mnt/shared
+   ```
+
+> **注意：** 使用 stunnel 时，NFS 挂载地址始终是 `127.0.0.1`（本地隧道端点），而非服务器的真实 IP。
+
+#### 服务器端使用 stunnel（替代方案）
+
+如果不使用内置 TLS，也可以在服务器端运行 stunnel 来包装 NFS 端口：
+
+**在服务器（Windows）上：**
+
+1. 从 [stunnel 官网](https://www.stunnel.org/downloads.html) 下载 Windows 版本。
+2. 创建 `stunnel.conf`：
+
+   ```ini
+   [nfs]
+   accept = 2049
+   connect = 127.0.0.1:12049
+   cert = C:/etc/rustnfssvc/server.crt
+   key = C:/etc/rustnfssvc/server.key
+   ```
+
+3. 配置 RustNfsSvc 监听内部端口：
+
+   ```toml
+   [nfs]
+   listen_address = "127.0.0.1:12049"
+   ```
+
+4. 先启动 stunnel，再启动 RustNfsSvc。stunnel 将加密端口 2049 上的流量，并转发到内部 NFS 端口。
 
 ## 客户端挂载
 

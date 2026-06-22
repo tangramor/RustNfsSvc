@@ -18,16 +18,20 @@ bind_ip = "0.0.0.0"              # SEC-014
 
 max_connections = 128             # SEC-025
 
-max_conn_rate_per_ip = 10         # SEC-025
+max_conn_rate_per_ip = 60         # SEC-025 (NFS clients need multiple connections per mount)
 
-enable_udp = true                 # SEC-026 (生产建议 false)
+enable_udp = true                 # SEC-026 (Production suggest false)
 
 
-[tls]                             # SEC-015
+[tls]                             # SEC-015: TLS encryption for NFS traffic
 enabled = false
-
+# When enabled, cert_path and key_path must point to PEM-format files:
+#   - cert_path: Server certificate (PEM, can contain chain)
+#   - key_path:  Private key (PEM, PKCS8 preferred; PKCS1 RSA also accepted)
+# Example:
+#   cert_path = "C:/etc/rustnfssvc/server.crt"
+#   key_path  = "C:/etc/rustnfssvc/server.key"
 cert_path = ""
-
 key_path = ""
 
 [exports]

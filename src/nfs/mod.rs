@@ -13,6 +13,19 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+// SEC-015: TLS support
+use rustls::ServerConfig;
+use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
+use tokio_rustls::TlsAcceptor;
+
+/// Ensure the rustls CryptoProvider (ring) is installed as the process-level default.
+/// Must be called before any `ServerConfig::builder()` invocation.
+/// Safe to call multiple times — subsequent calls are no-ops.
+fn ensure_crypto_provider() {
+    // install_default() returns Err if a provider is already installed; that's fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 use crate::exports::ExportsManager;
 
 // NFS program numbers
@@ -44,8 +57,8 @@ pub const MAX_XDR_OPAQUE: usize = 4 * 1024 * 1024; // 4MB
 // SEC-025: Connection rate limiter.
 // Tracks the number of TCP connections per IP address within a time window.
 struct ConnRateLimiter {
-    /// (connection_count_in_window, window_start_instant)
-    per_ip: Mutex<HashMap<std::net::IpAddr, (usize, std::time::Instant)>>,
+    /// (connection_count_in_window, window_start_instant, already_warned_this_window)
+    per_ip: Mutex<HashMap<std::net::IpAddr, (usize, std::time::Instant, bool)>>,
     /// Rate limit window duration
     window: std::time::Duration,
     /// Max new connections per IP per window
@@ -62,26 +75,34 @@ impl ConnRateLimiter {
     }
 
     /// Returns true if the connection from this IP is allowed.
-    async fn check(&self, ip: std::net::IpAddr) -> bool {
+    /// Sets `first_reject` to true the first time an IP is rejected in a window
+    /// (caller can use this to emit warn vs debug).
+    async fn check(&self, ip: std::net::IpAddr) -> (bool, bool) {
         let mut map = self.per_ip.lock().await;
         let now = std::time::Instant::now();
-        let entry = map.entry(ip).or_insert((0, now));
+        let entry = map.entry(ip).or_insert((0, now, false));
 
         // Reset counter if outside the window
         if now.duration_since(entry.1) > self.window {
-            *entry = (1, now);
-            return true;
+            *entry = (1, now, false);
+            return (true, false);
         }
 
         entry.0 += 1;
-        entry.0 <= self.max_per_ip
+        if entry.0 <= self.max_per_ip {
+            (true, false)
+        } else {
+            let first = !entry.2;
+            entry.2 = true;
+            (false, first)
+        }
     }
 
     /// Periodically clean up stale entries to prevent unbounded growth.
     async fn cleanup(&self) {
         let mut map = self.per_ip.lock().await;
         let now = std::time::Instant::now();
-        map.retain(|_, (count, start)| {
+        map.retain(|_, (count, start, _)| {
             now.duration_since(*start) <= self.window || *count > 0
         });
     }
@@ -94,6 +115,59 @@ impl Drop for ConnGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+// SEC-015: Load TLS server configuration from cert and key files.
+fn load_tls_config(cert_path: &str, key_path: &str) -> anyhow::Result<Arc<ServerConfig>> {
+    use crate::path_ext::to_extended_path;
+    use std::io::BufReader;
+    use std::path::Path;
+
+    // Install ring as the process-level CryptoProvider (rustls 0.23 requirement)
+    ensure_crypto_provider();
+
+    let cert_file = std::fs::File::open(to_extended_path(Path::new(cert_path)))
+        .map_err(|e| anyhow::anyhow!("Cannot open TLS cert '{}': {}", cert_path, e))?;
+    let key_file = std::fs::File::open(to_extended_path(Path::new(key_path)))
+        .map_err(|e| anyhow::anyhow!("Cannot open TLS key '{}': {}", key_path, e))?;
+
+    let certs = certs(&mut BufReader::new(cert_file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("TLS cert parse error: {}", e))?;
+
+    if certs.is_empty() {
+        return Err(anyhow::anyhow!("No certificates found in '{}'", cert_path));
+    }
+
+    // Try PKCS8 first, then fall back to PKCS1 RSA
+    let mut keys = pkcs8_private_keys(&mut BufReader::new(key_file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("TLS key parse error: {}", e))?;
+
+    let key = if !keys.is_empty() {
+        rustls::pki_types::PrivateKeyDer::Pkcs8(keys.remove(0))
+    } else {
+        // SEC-015: Fallback to RSA private keys if PKCS8 parsing yields nothing
+        let key_file2 = std::fs::File::open(to_extended_path(Path::new(key_path)))
+            .map_err(|e| anyhow::anyhow!("Cannot reopen TLS key '{}': {}", key_path, e))?;
+        let mut rsa_keys = rsa_private_keys(&mut BufReader::new(key_file2))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("TLS RSA key parse error: {}", e))?;
+        if rsa_keys.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No PKCS8 private key found in '{}'. \
+                 Use 'openssl pkcs8 -topk8 -nocrypt' to convert if needed.",
+                key_path
+            ));
+        }
+        rustls::pki_types::PrivateKeyDer::Pkcs1(rsa_keys.remove(0))
+    };
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    Ok(Arc::new(config))
 }
 
 pub struct NfsServer {
@@ -123,6 +197,20 @@ impl NfsServer {
             warn!("SEC-015: TLS is not enabled. All NFS traffic is unencrypted. \
                    Use VPN or SSH tunneling for production environments.");
         }
+
+        // SEC-015: Load TLS config if enabled
+        let tls_acceptor: Option<TlsAcceptor> = if self.config.tls.enabled {
+            let cert = self.config.tls.cert_path.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("TLS enabled but cert_path not set"))?;
+            let key = self.config.tls.key_path.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("TLS enabled but key_path not set"))?;
+            let tls_cfg = load_tls_config(cert, key)?;
+            info!("SEC-015: TLS enabled, loaded certificate from '{}'", cert);
+            Some(TlsAcceptor::from(tls_cfg))
+        } else {
+            warn!("SEC-015: TLS is not enabled. All NFS traffic is unencrypted.");
+            None
+        };
 
         let bind_ip = self.config.nfs.bind_ip.clone();
 
@@ -184,6 +272,7 @@ impl NfsServer {
                 enable_udp,
                 conn_count,
                 rate_limiter,
+                tls_acceptor,
             ).await {
                 error!("NFS server error: {}", e);
             }
@@ -201,6 +290,7 @@ impl NfsServer {
         enable_udp: bool,
         conn_count: Arc<AtomicUsize>,
         rate_limiter: Arc<ConnRateLimiter>,
+        tls_acceptor: Option<TlsAcceptor>,
     ) -> Result<()> {
         let nfs_addr = format!("{}:2049", bind_ip);
         info!("Starting unified NFS server on {}", nfs_addr);
@@ -295,10 +385,15 @@ impl NfsServer {
         // Handle TCP connections
         loop {
             match tcp_listener.accept().await {
-                Ok((mut stream, addr)) => {
+                Ok((stream, addr)) => {
                     // SEC-025: Per-IP connection rate limiting
-                    if !rate_limiter.check(addr.ip()).await {
-                        warn!("SEC-025: Connection rate limit exceeded for {}, rejecting", addr.ip());
+                    let (allowed, first_reject) = rate_limiter.check(addr.ip()).await;
+                    if !allowed {
+                        if first_reject {
+                            warn!("SEC-025: Connection rate limit exceeded for {}, rejecting (subsequent rejects silenced)", addr.ip());
+                        } else {
+                            debug!("SEC-025: Connection rate limit exceeded for {}, rejecting", addr.ip());
+                        }
                         drop(stream);
                         continue;
                     }
@@ -318,128 +413,162 @@ impl NfsServer {
                     let v4_tcp = v4_server.clone();
                     let conn_count_clone = conn_count.clone();
 
+                    let tls_acc = tls_acceptor.clone();
+
                     tokio::spawn(async move {
                         // SEC-025: Decrement connection counter on exit
                         let _conn_guard = ConnGuard(conn_count_clone);
 
-                        // TCP is a byte stream, not message-based.
-                        // We must buffer incoming data and process complete NFS records.
-                        // NFS over TCP uses RFC 1831 record marking: 4-byte header per record.
-                        let mut recv_buf = Vec::with_capacity(65536);
-
-                        loop {
-                            // Try to process all complete records already in the buffer
-                            while recv_buf.len() >= 4 {
-                                let record_marking = u32::from_be_bytes([
-                                    recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3],
-                                ]);
-                                let is_last_record = (record_marking & 0x80000000) != 0;
-                                let record_length = (record_marking & 0x7FFFFFFF) as usize;
-
-                                if !is_last_record {
-                                    warn!("Multi-record fragments not supported, discarding connection");
-                                    break;
-                                }
-
-                                if record_length < 20 {
-                                    warn!("Invalid RPC record length: {}, discarding 4 bytes", record_length);
-                                    recv_buf.drain(0..4);
-                                    continue;
-                                }
-
-                                // SEC-009: Reject oversized records
-                                if record_length > MAX_RECORD_LENGTH {
-                                    warn!("Oversized NFS record: {} bytes (max {}), dropping connection", record_length, MAX_RECORD_LENGTH);
-                                    return;
-                                }
-
-                                let total_msg_len = 4 + record_length;
-                                if recv_buf.len() < total_msg_len {
-                                    // Incomplete record — need more data
-                                    break;
-                                }
-
-                                // Extract the complete record
-                                let record_data: Vec<u8> = recv_buf.drain(0..total_msg_len).collect();
-                                let rpc_data = &record_data[4..]; // skip record marking header
-
-                                // Parse RPC header
-                                if rpc_data.len() < 20 {
-                                    continue;
-                                }
-
-                                let program = u32::from_be_bytes([
-                                    rpc_data[12], rpc_data[13], rpc_data[14], rpc_data[15],
-                                ]);
-                                let version = u32::from_be_bytes([
-                                    rpc_data[16], rpc_data[17], rpc_data[18], rpc_data[19],
-                                ]);
-
-                                info!("RPC header: program={}, version={}", program, version);
-
-                                // Process the request
-                                let response_opt = if program == NFS_PROGRAM {
-                                    if version == NFS_V4 {
-                                        info!("Routing to NFS v4 TCP handler");
-                                        v4_tcp.handle_request(rpc_data).await
-                                    } else if version == NFS_V3 {
-                                        info!("Routing to NFS v3 TCP handler");
-                                        v3_tcp.handle_request(rpc_data, addr.ip()).await
-                                    } else {
-                                        warn!("Unsupported NFS version: {}", version);
-                                        None
-                                    }
-                                } else if program == NFS_ACL_PROGRAM {
-                                    info!("NFS ACL program requested - not supported, returning error");
-                                    Self::make_rpc_error_reply(rpc_data, 1)
-                                } else {
-                                    warn!("Unsupported RPC program: {}", program);
-                                    None
-                                };
-
-                                // Send response with record marking
-                                if let Some(response) = response_opt {
-                                    let response_len = response.len() as u32;
-                                    let rm = 0x80000000 | response_len; // last fragment flag
-                                    let mut full_response = Vec::with_capacity(4 + response.len());
-                                    full_response.extend_from_slice(&rm.to_be_bytes());
-                                    full_response.extend_from_slice(&response);
-
-                                    debug!("Sending NFS TCP response ({} bytes)", full_response.len());
-
-                                    if let Err(e) = stream.write_all(&full_response).await {
-                                        error!("Failed to send NFS TCP response: {}", e);
-                                        return; // drop connection
-                                    }
-                                }
-                            }
-
-                            // Read more data from the TCP stream
-                            let mut tmp = [0u8; 65536];
-                            match stream.read(&mut tmp).await {
-                                Ok(0) => {
-                                    info!("TCP connection closed by {}", addr);
-                                    return;
-                                }
-                                Ok(n) => {
-                                    info!("Received TCP data from {} ({} bytes, buffer now {})", addr, n, recv_buf.len() + n);
-                                    recv_buf.extend_from_slice(&tmp[..n]);
-                                    // SEC-005: Drop connection if buffer exceeds maximum
-                                    if recv_buf.len() > MAX_RECV_BUF {
-                                        warn!("TCP recv buffer exceeded max ({} > {}), dropping connection from {}", recv_buf.len(), MAX_RECV_BUF, addr);
-                                        return;
-                                    }
+                        if let Some(acceptor) = tls_acc {
+                            // TLS path
+                            match acceptor.accept(stream).await {
+                                Ok(tls_stream) => {
+                                    let (reader, writer) = tokio::io::split(tls_stream);
+                                    Self::handle_nfs_stream(
+                                        Box::new(reader), Box::new(writer),
+                                        addr, v3_tcp, v4_tcp,
+                                    ).await;
                                 }
                                 Err(e) => {
-                                    error!("TCP read error from {}: {}", addr, e);
-                                    return;
+                                    warn!("TLS handshake failed from {}: {}", addr, e);
                                 }
                             }
+                        } else {
+                            // Plain TCP path
+                            let (reader, writer) = tokio::io::split(stream);
+                            Self::handle_nfs_stream(
+                                Box::new(reader), Box::new(writer),
+                                addr, v3_tcp, v4_tcp,
+                            ).await;
                         }
                     });
                 }
                 Err(e) => {
                     error!("TCP accept error: {}", e);
+                }
+            }
+        }
+    }
+
+    // SEC-015: Handle an NFS stream (TLS or plain TCP) — shared between both paths.
+    async fn handle_nfs_stream(
+        mut reader: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        mut writer: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+        addr: std::net::SocketAddr,
+        v3_server: protocol::NfsProtocolServer,
+        v4_server: nfs4::Nfs4Server,
+    ) {
+        // TCP is a byte stream, not message-based.
+        // We must buffer incoming data and process complete NFS records.
+        // NFS over TCP uses RFC 1831 record marking: 4-byte header per record.
+        let mut recv_buf = Vec::with_capacity(65536);
+
+        loop {
+            // Try to process all complete records already in the buffer
+            while recv_buf.len() >= 4 {
+                let record_marking = u32::from_be_bytes([
+                    recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3],
+                ]);
+                let is_last_record = (record_marking & 0x80000000) != 0;
+                let record_length = (record_marking & 0x7FFFFFFF) as usize;
+
+                if !is_last_record {
+                    warn!("Multi-record fragments not supported, discarding connection");
+                    return;
+                }
+
+                if record_length < 20 {
+                    warn!("Invalid RPC record length: {}, discarding 4 bytes", record_length);
+                    recv_buf.drain(0..4);
+                    continue;
+                }
+
+                // SEC-009: Reject oversized records
+                if record_length > MAX_RECORD_LENGTH {
+                    warn!("Oversized NFS record: {} bytes (max {}), dropping connection", record_length, MAX_RECORD_LENGTH);
+                    return;
+                }
+
+                let total_msg_len = 4 + record_length;
+                if recv_buf.len() < total_msg_len {
+                    // Incomplete record — need more data
+                    break;
+                }
+
+                // Extract the complete record
+                let record_data: Vec<u8> = recv_buf.drain(0..total_msg_len).collect();
+                let rpc_data = &record_data[4..]; // skip record marking header
+
+                // Parse RPC header
+                if rpc_data.len() < 20 {
+                    continue;
+                }
+
+                let program = u32::from_be_bytes([
+                    rpc_data[12], rpc_data[13], rpc_data[14], rpc_data[15],
+                ]);
+                let version = u32::from_be_bytes([
+                    rpc_data[16], rpc_data[17], rpc_data[18], rpc_data[19],
+                ]);
+
+                info!("RPC header: program={}, version={}", program, version);
+
+                // Process the request
+                let response_opt = if program == NFS_PROGRAM {
+                    if version == NFS_V4 {
+                        info!("Routing to NFS v4 TCP handler");
+                        v4_server.handle_request(rpc_data).await
+                    } else if version == NFS_V3 {
+                        info!("Routing to NFS v3 TCP handler");
+                        v3_server.handle_request(rpc_data, addr.ip()).await
+                    } else {
+                        warn!("Unsupported NFS version: {}", version);
+                        None
+                    }
+                } else if program == NFS_ACL_PROGRAM {
+                    info!("NFS ACL program requested - not supported, returning error");
+                    NfsServer::make_rpc_error_reply(rpc_data, 1)
+                } else {
+                    warn!("Unsupported RPC program: {}", program);
+                    None
+                };
+
+                // Send response with record marking
+                if let Some(response) = response_opt {
+                    let response_len = response.len() as u32;
+                    let rm = 0x80000000 | response_len; // last fragment flag
+                    let mut full_response = Vec::with_capacity(4 + response.len());
+                    full_response.extend_from_slice(&rm.to_be_bytes());
+                    full_response.extend_from_slice(&response);
+
+                    debug!("Sending NFS TCP response ({} bytes)", full_response.len());
+
+                    if let Err(e) = writer.write_all(&full_response).await {
+                        error!("Failed to send NFS TCP response: {}", e);
+                        return; // drop connection
+                    }
+                }
+            }
+
+            // Read more data from the TCP stream
+            let mut tmp = [0u8; 65536];
+            match reader.read(&mut tmp).await {
+                Ok(0) => {
+                    info!("TCP connection closed by {}", addr);
+                    return;
+                }
+                Ok(n) => {
+                    info!("Received TCP data from {} ({} bytes, buffer now {})", addr, n, recv_buf.len() + n);
+                    recv_buf.extend_from_slice(&tmp[..n]);
+                    // SEC-005: Drop connection if buffer exceeds maximum
+                    if recv_buf.len() > MAX_RECV_BUF {
+                        warn!("TCP recv buffer exceeded max ({} > {}), dropping connection from {}", recv_buf.len(), MAX_RECV_BUF, addr);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    error!("TCP read error from {}: {}", addr, e);
+                    return;
                 }
             }
         }

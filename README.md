@@ -14,6 +14,7 @@ A high-performance NFS (Network File System) server for Windows, written in Rust
 - **PORTMAP** — RPC portmapper on port 111 (TCP + UDP)
 - **Async I/O** — Built on Tokio for high concurrency
 - **Flexible configuration** — TOML-based config with per-export access control (CIDR)
+- **TLS encryption** — Built-in TLS support (rustls) for encrypted NFS transport (SEC-015)
 - **Structured logging** — Rolling log files with configurable level and rotation
 
 ## Project Structure
@@ -22,13 +23,13 @@ A high-performance NFS (Network File System) server for Windows, written in Rust
 RustNfsSvc/
 ├── src/
 │   ├── main.rs              # Entry point: CLI arg parsing (install/uninstall/service/standalone)
+│   ├── path_ext.rs          # Windows \\?\ extended-path helper (MAX_PATH fix)
 │   ├── service.rs           # Windows Service lifecycle (install/uninstall via sc.exe, run mode)
 │   ├── config.rs            # Configuration loading and validation
 │   ├── exports.rs           # Export directory management and file handle resolution
 │   ├── logging.rs           # Log initialization and rotation
-│   ├── path_ext.rs          # Extended path handling (Windows-specific)
 │   └── nfs/
-│       ├── mod.rs           # Unified NFS server (TCP + UDP, v3 + v4)
+│       ├── mod.rs           # Unified NFS server (TCP + UDP, v3 + v4, TLS)
 │       ├── nfs4.rs          # NFSv4.1 protocol implementation (~3350 lines)
 │       ├── protocol.rs      # NFSv3 protocol implementation
 │       ├── mount.rs         # MOUNT protocol (v1/v3)
@@ -104,15 +105,15 @@ listen_address = "0.0.0.0:2049"
 enable_v3 = true
 enable_v4 = true
 threads = 4
-bind_ip = "0.0.0.0"               # SEC-014
-max_connections = 128             # SEC-025
-max_conn_rate_per_ip = 10         # SEC-025
-enable_udp = true                 # SEC-026 (Suggest false for production)
+bind_ip = "0.0.0.0"                # Bind to specific IP for security
+max_connections = 128              # Global concurrent connection limit
+max_conn_rate_per_ip = 60          # Per-IP rate limit (connections per 60s window)
+enable_udp = true                  # Enable UDP (set false for production with TLS)
 
-[tls]                             # SEC-015
+[tls]                              # SEC-015: TLS encryption
 enabled = false
-cert_path = ""
-key_path = ""
+cert_path = ""                     # PEM certificate path (required when enabled)
+key_path = ""                      # PEM private key path (PKCS8 or PKCS1 RSA)
 
 [[exports.entries]]
 path = "C:\\Shared"
@@ -127,14 +128,6 @@ max_log_size_mb = 100
 max_log_files = 10
 ```
 
-Administrator run the following command to enable the registry option to eliminate the path limit in combination with the manifest:
-
-```powershell
-New-ItemProperty `
-  -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
-  -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force
-```
-
 ### Export Options
 
 | Option | Description |
@@ -146,6 +139,102 @@ New-ItemProperty `
 | `no_subtree_check` | Disable subtree checking (better performance) |
 | `insecure` | Allow connections from ports ≥ 1024 |
 | `no_root_squash` | Allow root to access files as root |
+
+### TLS Configuration
+
+RustNfsSvc supports built-in TLS encryption for NFS traffic over TCP. When enabled, the server uses **rustls** (ring backend) to encrypt all NFS/MOUNT/PORTMAP TCP connections.
+
+#### Enabling TLS
+
+1. **Generate certificates** — Create a PEM certificate and private key for the server:
+
+   ```bash
+   # Using OpenSSL
+   openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt -days 365 -nodes \
+     -subj "/CN=nfs-server" -addext "subjectAltName=IP:192.168.1.1"
+
+   # Convert key to PKCS8 (preferred by rustls)
+   openssl pkcs8 -topk8 -nocrypt -in server.key -out server.key.pkcs8
+   ```
+
+2. **Configure** — Edit `config.toml`:
+
+   ```toml
+   [tls]
+   enabled = true
+   cert_path = "C:/etc/rustnfssvc/server.crt"
+   key_path  = "C:/etc/rustnfssvc/server.key"    # PKCS8 or PKCS1 RSA accepted
+   ```
+
+3. **Disable UDP** — TLS only works over TCP. Set `enable_udp = false` when using TLS.
+
+4. **Restart** — Restart the service for TLS to take effect.
+
+#### Client-side Mount with TLS
+
+Linux NFS clients do not natively support TLS. Use **stunnel** to create an encrypted tunnel:
+
+**On the client (Linux):**
+
+1. Install stunnel:
+
+   ```bash
+   sudo apt install stunnel4    # Debian/Ubuntu
+   sudo yum install stunnel     # RHEL/CentOS
+   ```
+
+2. Create `/etc/stunnel/nfs.conf`:
+
+   ```ini
+   [nfs]
+   client = yes
+   accept = 127.0.0.1:2049
+   connect = <server-ip>:2049
+   verifyChain = yes
+   CApath = /etc/ssl/certs
+   ; Or specify the server cert directly:
+   ; CAfile = /path/to/server.crt
+   ```
+
+3. Start stunnel:
+
+   ```bash
+   sudo systemctl start stunnel4
+   ```
+
+4. Mount via the local tunnel:
+
+   ```bash
+   sudo mount -t nfs4 -o vers=4,minorversion=1 127.0.0.1:/<alias> /mnt/shared
+   ```
+
+> **Note:** When using stunnel on both sides, the NFS mount address is always `127.0.0.1` (the local tunnel endpoint), not the server's real IP.
+
+#### Using stunnel on the Server Side (Alternative)
+
+If you prefer not to use the built-in TLS, you can also run stunnel on the server side to wrap the NFS port:
+
+**On the server (Windows):**
+
+1. Download [stunnel for Windows](https://www.stunnel.org/downloads.html).
+2. Create `stunnel.conf`:
+
+   ```ini
+   [nfs]
+   accept = 2049
+   connect = 127.0.0.1:12049
+   cert = C:/etc/rustnfssvc/server.crt
+   key = C:/etc/rustnfssvc/server.key
+   ```
+
+3. Configure RustNfsSvc to listen on the internal port:
+
+   ```toml
+   [nfs]
+   listen_address = "127.0.0.1:12049"
+   ```
+
+4. Start stunnel, then start RustNfsSvc. Stunnel will encrypt traffic on port 2049 and forward to the internal NFS port.
 
 ## Client Mount
 

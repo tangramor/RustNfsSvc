@@ -54,7 +54,13 @@ ctrlc = "3.4"
 # Windows Service support
 windows-service = "0.6"
 
+# TLS support (SEC-015)
+rustls         = { version = "0.23", features = ["ring"] }
+tokio-rustls   = "0.26"
+rustls-pemfile = "2"
+
 [dev-dependencies]
+rcgen    = "0.13"
 tempfile = "3.8"
 
 [profile.release]
