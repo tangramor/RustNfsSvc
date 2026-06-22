@@ -2,14 +2,15 @@
 
 English | [中文](./README_zh.md)
 
-A high-performance NFS (Network File System) server for Windows, written in Rust. Supports both NFSv3 and NFSv4.1, enabling Linux/Unix clients to mount Windows directories transparently.
+A high-performance NFS (Network File System) server for Windows, written in Rust. Supports NFSv3, NFSv4.1, and NFSv4.2, enabling Linux/Unix clients to mount Windows directories transparently.
 
 ## Features
 
 - **NFSv3** — Full protocol support (MOUNT, PORTMAP, NFSv3 procedures)
 - **NFSv4.1** — COMPOUND operations, SEQUENCE, OPEN, CLOSE, READ, WRITE, READDIR, LOCK/LOCKU, SETATTR, and more
+- **NFSv4.2** — READ_PLUS, COPY, SEEK, CLONE, plus 9 stub operations per RFC 7862
 - **Native Windows Service** — Install/uninstall as a Windows Service with automatic startup
-- **Dual-stack NFS** — Run NFSv3 and NFSv4.1 simultaneously on the same port (2049)
+- **Dual-stack NFS** — Run NFSv3, NFSv4.1, and NFSv4.2 simultaneously on the same port (2049)
 - **MOUNT protocol** — NFSv3 MOUNT protocol on port 20048
 - **PORTMAP** — RPC portmapper on port 111 (TCP + UDP)
 - **Async I/O** — Built on Tokio for high concurrency
@@ -30,7 +31,7 @@ RustNfsSvc/
 │   ├── logging.rs           # Log initialization and rotation
 │   └── nfs/
 │       ├── mod.rs           # Unified NFS server (TCP + UDP, v3 + v4, TLS)
-│       ├── nfs4.rs          # NFSv4.1 protocol implementation (~3350 lines)
+│       ├── nfs4.rs          # NFSv4.1/4.2 protocol implementation (~4100 lines)
 │       ├── protocol.rs      # NFSv3 protocol implementation
 │       ├── mount.rs         # MOUNT protocol (v1/v3)
 │       └── portmap.rs       # PORTMAP / RPCBIND service
@@ -238,7 +239,13 @@ If you prefer not to use the built-in TLS, you can also run stunnel on the serve
 
 ## Client Mount
 
-### NFSv4.1 (recommended)
+### NFSv4.2 (recommended)
+
+```bash
+sudo mount -t nfs4 -o vers=4,minorversion=2 <server-ip>:/<alias> /mnt/shared
+```
+
+### NFSv4.1
 
 ```bash
 sudo mount -t nfs4 -o vers=4,minorversion=1 <server-ip>:/<alias> /mnt/shared
@@ -261,7 +268,8 @@ echo "hello from NFS" > /mnt/shared/test.txt
 
 ```
                         ┌─────────────────────┐
-   Linux NFS Client ───│  NFSv4.1 (TCP/2049) │───┐
+   Linux NFS Client ───│  NFSv4.2 (TCP/2049) │───┐
+   Linux NFS Client ───│  NFSv4.1 (TCP/2049) │───┤
    Linux NFS Client ───│  NFSv3  (TCP/2049)  │───┤
    Linux NFS Client ───│  NFSv3  (UDP/2049)  │───┤
                         └─────────────────────┘   │
@@ -280,9 +288,9 @@ echo "hello from NFS" > /mnt/shared/test.txt
                                          └─────────────────┘
 ```
 
-- **Unified listener** — A single TCP/UDP listener on port 2049 handles both NFSv3 and NFSv4.1 requests, dispatching by RPC program version
+- **Unified listener** — A single TCP/UDP listener on port 2049 handles NFSv3, NFSv4.1, and NFSv4.2 requests, dispatching by RPC program version
 - **ExportsManager** — Manages file handle resolution, directory enumeration, and file I/O against the local Windows filesystem
-- **Session management** — NFSv4.1 sessions with slot/sequence tracking for exactly-once semantics
+- **Session management** — NFSv4.1/4.2 sessions with slot/sequence tracking for exactly-once semantics
 
 ## Development
 
@@ -307,9 +315,30 @@ cargo clippy
 | NFSv3 | [RFC 1813](https://www.rfc-editor.org/rfc/rfc1813) | Supported |
 | NFSv4.0 | [RFC 3010](https://www.rfc-editor.org/rfc/rfc3010) | Partial |
 | NFSv4.1 | [RFC 5661](https://www.rfc-editor.org/rfc/rfc5661) | Supported |
+| NFSv4.2 | [RFC 7862](https://www.rfc-editor.org/rfc/rfc7862) | Supported |
 | MOUNT v1 | [RFC 1094](https://www.rfc-editor.org/rfc/rfc1094) | Supported |
 | MOUNT v3 | [RFC 1813](https://www.rfc-editor.org/rfc/rfc1813) | Supported |
 | PORTMAP v2 | [RFC 1057](https://www.rfc-editor.org/rfc/rfc1057) | Supported |
+
+### NFSv4.2 Operations (RFC 7862)
+
+| Operation | Opcode | Status | Description |
+|-----------|--------|--------|-------------|
+| READ_PLUS | 68 | ✅ Supported | Enhanced read returning data/hole information |
+| COPY | 60 | ✅ Supported | Server-side intra-server file copy |
+| SEEK | 69 | ✅ Supported | Find next data or hole offset in a file |
+| CLONE | 71 | ✅ Supported | Server-side file range clone (read+write) |
+| ALLOCATE | 59 | Stub | Returns NOTSUPP |
+| DEALLOCATE | 62 | Stub | Returns NOTSUPP |
+| IO_ADVISE | 63 | Stub | Returns NOTSUPP |
+| LAYOUTERROR | 64 | Stub | Returns NOTSUPP |
+| LAYOUTSTATS | 65 | Stub | Returns NOTSUPP |
+| OFFLOAD_CANCEL | 66 | Stub | Returns NOTSUPP |
+| OFFLOAD_STATUS | 67 | Stub | Returns NOTSUPP |
+| WRITE_SAME | 70 | Stub | Returns NOTSUPP |
+| COPY_NOTIFY | 61 | Stub | Returns NOTSUPP |
+
+> **Note:** Stub operations return `NFS4ERR_NOTSUPP`. COPY only supports intra-server copy; inter-server copy is not supported. CLONE is implemented as a simplified read+write (no BlockClone API). SEEK uses a simplified model (SEEK4_HOLE returns file size) since Windows does not expose sparse file hole information via standard APIs.
 
 ## License
 

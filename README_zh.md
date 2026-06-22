@@ -2,14 +2,15 @@
 
 [English](./README.md) | 中文
 
-一个高性能的 Windows NFS（网络文件系统）服务器，使用 Rust 编写。同时支持 NFSv3 和 NFSv4.1，使 Linux/Unix 客户端能够透明挂载 Windows 目录。
+一个高性能的 Windows NFS（网络文件系统）服务器，使用 Rust 编写。支持 NFSv3、NFSv4.1 和 NFSv4.2，使 Linux/Unix 客户端能够透明挂载 Windows 目录。
 
 ## 功能特性
 
 - **NFSv3** — 完整协议支持（MOUNT、PORTMAP、NFSv3 过程）
 - **NFSv4.1** — COMPOUND 操作、SEQUENCE、OPEN、CLOSE、READ、WRITE、READDIR、LOCK/LOCKU、SETATTR 等
+- **NFSv4.2** — READ_PLUS、COPY、SEEK、CLONE，以及 RFC 7862 定义的 9 个 stub 操作
 - **原生 Windows 服务** — 可安装/卸载为 Windows 服务，支持开机自启
-- **双栈 NFS** — 在同一端口（2049）上同时运行 NFSv3 和 NFSv4.1
+- **双栈 NFS** — 在同一端口（2049）上同时运行 NFSv3、NFSv4.1 和 NFSv4.2
 - **MOUNT 协议** — NFSv3 MOUNT 协议，端口 20048
 - **PORTMAP** — RPC 端口映射服务，端口 111（TCP + UDP）
 - **异步 I/O** — 基于 Tokio 构建，支持高并发
@@ -30,7 +31,7 @@ RustNfsSvc/
 │   ├── logging.rs           # 日志初始化与轮转
 │   └── nfs/
 │       ├── mod.rs           # 统一 NFS 服务器（TCP + UDP，v3 + v4，TLS）
-│       ├── nfs4.rs          # NFSv4.1 协议实现（约 3350 行）
+│       ├── nfs4.rs          # NFSv4.1/4.2 协议实现（约 4100 行）
 │       ├── protocol.rs      # NFSv3 协议实现
 │       ├── mount.rs         # MOUNT 协议（v1/v3）
 │       └── portmap.rs       # PORTMAP / RPCBIND 服务
@@ -238,7 +239,13 @@ Linux NFS 客户端原生不支持 TLS。使用 **stunnel** 建立加密隧道�
 
 ## 客户端挂载
 
-### NFSv4.1（推荐）
+### NFSv4.2（推荐）
+
+```bash
+sudo mount -t nfs4 -o vers=4,minorversion=2 <服务器IP>:/<别名> /mnt/shared
+```
+
+### NFSv4.1
 
 ```bash
 sudo mount -t nfs4 -o vers=4,minorversion=1 <服务器IP>:/<别名> /mnt/shared
@@ -261,7 +268,8 @@ echo "hello from NFS" > /mnt/shared/test.txt
 
 ```
                         ┌─────────────────────┐
-   Linux NFS 客户端 ───│  NFSv4.1 (TCP/2049) │───┐
+   Linux NFS 客户端 ───│  NFSv4.2 (TCP/2049) │───┐
+   Linux NFS 客户端 ───│  NFSv4.1 (TCP/2049) │───┤
    Linux NFS 客户端 ───│  NFSv3  (TCP/2049)  │───┤
    Linux NFS 客户端 ───│  NFSv3  (UDP/2049)  │───┤
                         └─────────────────────┘   │
@@ -280,9 +288,9 @@ echo "hello from NFS" > /mnt/shared/test.txt
                                          └─────────────────┘
 ```
 
-- **统一监听器** — 在端口 2049 上通过单个 TCP/UDP 监听器同时处理 NFSv3 和 NFSv4.1 请求，按 RPC 程序版本分发
+- **统一监听器** — 在端口 2049 上通过单个 TCP/UDP 监听器同时处理 NFSv3、NFSv4.1 和 NFSv4.2 请求，按 RPC 程序版本分发
 - **ExportsManager** — 管理文件句柄解析、目录枚举和针对本地 Windows 文件系统的文件 I/O
-- **会话管理** — NFSv4.1 会话使用槽位/序列跟踪，实现恰好一次语义
+- **会话管理** — NFSv4.1/4.2 会话使用槽位/序列跟踪，实现恰好一次语义
 
 ## 开发
 
@@ -307,9 +315,30 @@ cargo clippy
 | NFSv3 | [RFC 1813](https://www.rfc-editor.org/rfc/rfc1813) | 已支持 |
 | NFSv4.0 | [RFC 3010](https://www.rfc-editor.org/rfc/rfc3010) | 部分支持 |
 | NFSv4.1 | [RFC 5661](https://www.rfc-editor.org/rfc/rfc5661) | 已支持 |
+| NFSv4.2 | [RFC 7862](https://www.rfc-editor.org/rfc/rfc7862) | 已支持 |
 | MOUNT v1 | [RFC 1094](https://www.rfc-editor.org/rfc/rfc1094) | 已支持 |
 | MOUNT v3 | [RFC 1813](https://www.rfc-editor.org/rfc/rfc1813) | 已支持 |
 | PORTMAP v2 | [RFC 1057](https://www.rfc-editor.org/rfc/rfc1057) | 已支持 |
+
+### NFSv4.2 操作（RFC 7862）
+
+| 操作 | 操作码 | 状态 | 说明 |
+|------|--------|------|------|
+| READ_PLUS | 68 | ✅ 已支持 | 增强读取，返回数据/空洞信息 |
+| COPY | 60 | ✅ 已支持 | 服务器端文件复制（仅同服务器） |
+| SEEK | 69 | ✅ 已支持 | 查找文件中下一个数据或空洞偏移 |
+| CLONE | 71 | ✅ 已支持 | 服务器端文件范围克隆（读+写） |
+| ALLOCATE | 59 | Stub | 返回 NOTSUPP |
+| DEALLOCATE | 62 | Stub | 返回 NOTSUPP |
+| IO_ADVISE | 63 | Stub | 返回 NOTSUPP |
+| LAYOUTERROR | 64 | Stub | 返回 NOTSUPP |
+| LAYOUTSTATS | 65 | Stub | 返回 NOTSUPP |
+| OFFLOAD_CANCEL | 66 | Stub | 返回 NOTSUPP |
+| OFFLOAD_STATUS | 67 | Stub | 返回 NOTSUPP |
+| WRITE_SAME | 70 | Stub | 返回 NOTSUPP |
+| COPY_NOTIFY | 61 | Stub | 返回 NOTSUPP |
+
+> **注意：** Stub 操作返回 `NFS4ERR_NOTSUPP`。COPY 仅支持同服务器内复制，不支持跨服务器复制。CLONE 为简化的 read+write 实现（未使用 BlockClone API）。SEEK 使用简化模型（SEEK4_HOLE 返回文件大小），因为 Windows 不通过标准 API 暴露稀疏文件空洞信息。
 
 ## 许可证
 
